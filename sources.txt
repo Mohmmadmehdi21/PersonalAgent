@@ -1,0 +1,7 @@
+# Ek line = ek source video URL. Sirf wahi videos jinka reuse allowed ho
+# (CC-BY ya MrBeast ki permission/program ke under).
+# Upar se neeche process hota hai, har run mein 1 video se CLIPS_PER_DAY clips.
+# https://www.youtube.com/watch?v=XXXXXXXXXXX
+https://www.youtube.com/channel/UCX6OQ3DkcsbYNE6H8uQQuVA
+https://youtu.be/1WEAJ-DFkHE?si=rsDsae426Qe_rTG2
+https://youtu.be/1WEAJ-DFkHE?si=57iNTRsctXuM4Ymp
