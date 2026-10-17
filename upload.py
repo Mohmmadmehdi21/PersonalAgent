@@ -2,8 +2,12 @@ import os
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+from retry import (retry_upload, QuotaExceededError, AuthError,
+                   AccountUploadLimitError, NonRetryableAPIError,
+                   ExternalWriteOutcomeUnknownError, UploadCommittedInterruptedError,
+                   build_google_service, call_google_write)
+from logger import log, log_warn, log_error, mask_secrets
 
 SCOPES = [
     "https://www.googleapis.com/auth/youtube.upload",
@@ -19,7 +23,7 @@ def get_service():
         try:
             creds = Credentials.from_authorized_user_file("token.json", SCOPES)
         except Exception as e:
-            print(f"[OAuth] token.json corrupt ya invalid tha ({e}). Naya login karenge.")
+            print(f"[OAuth] token.json corrupt ya invalid tha ({mask_secrets(e)}). Naya login karenge.")
             creds = None
 
     # 2. Token refresh ya naya login
@@ -30,7 +34,7 @@ def get_service():
                 creds.refresh(Request())
                 print("[OAuth] Token successfully refresh ho gaya!")
             except Exception as e:
-                print(f"[OAuth] Token refresh fail hua ({e}). Re-login karenge.")
+                print(f"[OAuth] Token refresh fail hua ({mask_secrets(e)}). Re-login karenge.")
                 creds = None
 
         if not creds or not creds.valid:
@@ -45,7 +49,7 @@ def get_service():
             try:
                 creds = flow.run_local_server(port=0, open_browser=True)
             except Exception as e:
-                print(f"[OAuth] Browser auto-open nahi ho paya ({e}).")
+                print(f"[OAuth] Browser auto-open nahi ho paya ({mask_secrets(e)}).")
                 auth_url, _ = flow.authorization_url(prompt="consent")
                 print(f"\n[OAuth] Kripya neeche diye gaye link ko browser mein manually kholein aur login karein:\n{auth_url}\n")
                 creds = flow.run_local_server(port=0, open_browser=False)
@@ -54,7 +58,7 @@ def get_service():
                 f.write(creds.to_json())
             print("[OAuth] Authentication successful! 'token.json' file save ho gayi hai.")
 
-    return build("youtube", "v3", credentials=creds)
+    return build_google_service("youtube", "v3", creds)
 
 def upload(yt, video, thumb, title, desc, tags):
     body = {
@@ -70,11 +74,20 @@ def upload(yt, video, thumb, title, desc, tags):
         },
     }
     print(f"[Upload] Video upload ho raha hai: '{title[:50]}...'")
-    res = yt.videos().insert(
-        part="snippet,status",
-        body=body,
-        media_body=MediaFileUpload(video, resumable=True)
-    ).execute()
+    def _execute_insert():
+        return yt.videos().insert(
+            part="snippet,status",
+            body=body,
+            media_body=MediaFileUpload(video, resumable=True)
+        ).execute()
+
+    try:
+        res = retry_upload(_execute_insert)
+    except (AccountUploadLimitError, NonRetryableAPIError) as e:
+        msg = "[Quota Limit] Aaj ki upload limit poori ho chuki hai. Clips local 'work/' folder mein saved hain."
+        print(f"\n{msg}\n")
+        log_warn(msg)
+        raise
     vid = res["id"]
     privacy = res.get("status", {}).get("privacyStatus")
     if privacy == "private":
@@ -92,9 +105,18 @@ def upload(yt, video, thumb, title, desc, tags):
 
     if os.path.exists(thumb):
         try:
-            yt.thumbnails().set(videoId=vid, media_body=MediaFileUpload(thumb)).execute()
+            call_google_write(
+                lambda: yt.thumbnails().set(videoId=vid, media_body=MediaFileUpload(thumb)).execute(),
+                task=f"Thumbnail set {vid}",
+            )
             print(f"[Upload] Custom thumbnail set ho gaya!")
+        except KeyboardInterrupt as e:
+            raise UploadCommittedInterruptedError(vid) from e
+        except ExternalWriteOutcomeUnknownError as e:
+            if "interrupted" in str(e).lower():
+                raise UploadCommittedInterruptedError(vid) from e
+            print(f"[Upload] Thumbnail result unknown for confirmed video {vid}: {mask_secrets(e)}")
         except Exception as e:
-            print(f"[Upload] Custom thumbnail set nahi hua ({e}). (Channel phone-verified na ho to custom thumbnail allow nahi hota)")
+            print(f"[Upload] Custom thumbnail set nahi hua ({mask_secrets(e)}). (Channel phone-verified na ho to custom thumbnail allow nahi hota)")
 
     return vid

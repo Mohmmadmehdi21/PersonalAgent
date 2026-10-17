@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .tracker import DATA_DIR, read_videos
+from retry import create_groq_client, retry_groq
 
 LEARNINGS_FILE = DATA_DIR / "learnings.txt"
 REFRESH_FILE = DATA_DIR / "learnings_refreshed_at.txt"
@@ -47,22 +48,24 @@ def refresh_learnings(rows=None, generator=None, now=None):
     prompt = ("Summarize recurring content patterns in these top and bottom short-video examples. "
               "Keep it brief, transcript-grounded, non-prescriptive, and avoid claiming causation.\n" + examples)
     if generator is None:
-        from google import genai
-        from config import GEMINI_MODEL
+        from config import GROQ_MODEL
         import os
-        api_key = os.getenv("GEMINI_API_KEY")
+        api_key = os.getenv("GROQ_API_KEY")
         if not api_key:
-            print("GEMINI_API_KEY missing; learnings not refreshed.")
+            print("GROQ_API_KEY missing; learnings not refreshed.")
             return False
-        response = genai.Client(api_key=api_key).models.generate_content(model=GEMINI_MODEL, contents=prompt)
-        text = response.text or ""
+        client = create_groq_client(api_key)
+        response = retry_groq(lambda: client.chat.completions.create(
+            model=GROQ_MODEL, messages=[{"role": "user", "content": prompt}]
+        ))
+        text = response.choices[0].message.content or ""
     else:
         text = generator(prompt)
     output = ("Patterns that appeared more often among stronger examples / weaker examples:\n"
               "These observations are hints only; they do not prove causation. A sample of 15–20 videos "
               "is small and may be unreliable. Re-check as more data arrives.\n\n"
               "Examples (TOP 5 and BOTTOM 5; descriptive only):\n" + examples + "\n\n"
-              "Gemini summary:\n" + text.strip() + "\n")
+              "Groq summary:\n" + text.strip() + "\n")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     LEARNINGS_FILE.write_text(output, encoding="utf-8")
     REFRESH_FILE.write_text(now.astimezone(timezone.utc).isoformat(), encoding="utf-8")

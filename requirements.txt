@@ -1,9 +1,12 @@
-yt-dlp
+yt-dlp>=2026.08.19
 faster-whisper
-google-genai
+groq
 google-api-python-client
 google-auth-oauthlib
 google-auth-httplib2
 pillow
 python-dotenv
 tzdata
+edge-tts
+mediapipe
+opencv-python

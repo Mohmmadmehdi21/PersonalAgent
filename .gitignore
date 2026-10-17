@@ -1,8 +1,19 @@
 # Credentials & Secrets
 .env
 *.env
-client_secret.json
-token.json
+.env.*
+!.env.example
+client_secret*.json
+token*.json
+credentials*.json
+service-account*.json
+*-service-account*.json
+google-application-credentials*.json
+*.pem
+*.key
+*cookie*.txt
+cookies.txt
+*.cookies
 
 # Heavy / Generated Media
 work/
@@ -25,10 +36,14 @@ venv/
 env/
 ENV/
 .pytest_cache/
+tests/.monitoring-test.json
+data/monitoring.json
 
-# Logs
+# Logs & Runtime
 logs/
 *.log
+review/
+*.tmp
 
 # System Files
 .DS_Store

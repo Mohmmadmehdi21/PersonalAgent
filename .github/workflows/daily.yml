@@ -15,13 +15,26 @@ jobs:
         with: { python-version: "3.11" }
       - run: sudo apt-get update && sudo apt-get install -y ffmpeg fonts-dejavu-core
       - run: pip install -r requirements.txt
-      - name: Secrets files likho
+      - name: OAuth files securely write karo
+        env:
+          CLIENT_SECRET_JSON: ${{ secrets.CLIENT_SECRET_JSON }}
+          TOKEN_JSON: ${{ secrets.TOKEN_JSON }}
         run: |
-          echo '${{ secrets.CLIENT_SECRET_JSON }}' > client_secret.json
-          echo '${{ secrets.TOKEN_JSON }}' > token.json
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          for env_name, file_name in (("CLIENT_SECRET_JSON", "client_secret.json"), ("TOKEN_JSON", "token.json")):
+              value = os.environ.get(env_name, "")
+              if not value:
+                  raise SystemExit(f"Required GitHub Actions secret {env_name} is missing.")
+              Path(file_name).write_text(value, encoding="utf-8")
+          PY
       - run: python main.py
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          DRY_RUN: "false"
+          REQUIRE_REVIEW: "false"
+          OWN_CONTENT_ENABLED: "false"
       - name: state.json commit
         run: |
           git config user.name "bot"; git config user.email "bot@users.noreply.github.com"

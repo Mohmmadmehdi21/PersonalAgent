@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from zoneinfo import ZoneInfo
+from retry import retry_google_read
 
 DATA_DIR = Path("data")
 VIDEOS_FILE = DATA_DIR / "videos.csv"
@@ -125,13 +126,16 @@ def refresh_stats(youtube, now=None):
     changed = False
     for offset in range(0, len(ids), 50):
         batch = ids[offset:offset + 50]
-        statuses = youtube.videos().list(part="status", id=",".join(batch)).execute()
+        statuses = retry_google_read(
+            lambda: youtube.videos().list(part="status", id=",".join(batch)).execute(),
+            task="Growth video visibility lookup",
+        )
         public_ids = [item.get("id") for item in statuses.get("items", [])
                       if item.get("status", {}).get("privacyStatus") == "public"]
         for stats_offset in range(0, len(public_ids), 50):
-            statistics = youtube.videos().list(
+            statistics = retry_google_read(lambda: youtube.videos().list(
                 part="statistics", id=",".join(public_ids[stats_offset:stats_offset + 50])
-            ).execute()
+            ).execute(), task="Growth video statistics")
             stats_by_id = {item.get("id"): item.get("statistics", {}) for item in statistics.get("items", [])}
             for video_id in public_ids[stats_offset:stats_offset + 50]:
                 item_stats = stats_by_id.get(video_id)
