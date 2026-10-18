@@ -6,7 +6,7 @@
 - Install Python packages with `python -m pip install -r requirements.txt`.
 - Install FFmpeg and make `ffmpeg` available on `PATH`. On Windows, yt-dlp may also require Deno for some YouTube player challenges; install it and make `deno` available on `PATH` if downloads report that requirement.
 - `requirements.txt` currently lists direct dependencies without version pins. This intentionally avoids untested upgrades/downgrades in the existing pipeline. For a deployment, create and review a platform-specific lock file after validating the full media pipeline on that platform.
-- Direct dependencies: `yt-dlp`, `faster-whisper`, `groq`, `google-api-python-client`, `google-auth-oauthlib`, `google-auth-httplib2`, `pillow`, `python-dotenv`, `tzdata`, `edge-tts`, `mediapipe`, and `opencv-python`. CUDA is optional; Whisper falls back to CPU. FFmpeg is an external executable, not a Python package.
+- Direct dependencies: `yt-dlp`, `brotlicffi` (Brotli support for yt-dlp), `faster-whisper`, `groq`, `google-api-python-client`, `google-auth-oauthlib`, `google-auth-httplib2`, `pillow`, `python-dotenv`, `tzdata`, `edge-tts`, `mediapipe`, and `opencv-python`. CUDA is optional; Whisper falls back to CPU. FFmpeg is an external executable, not a Python package.
 
 ## Configuration file
 

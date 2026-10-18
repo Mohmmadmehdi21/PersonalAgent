@@ -147,3 +147,14 @@ uses pagination and returns at most 20 recent uploads. Reports are live and are 
 The Telegram bot can run a once-per-day preparation job and an optional analytics report. Configure `SCHEDULER_ENABLED=true`, `SCHEDULER_TIMEZONE` (IANA name), `SCHEDULER_PREPARE_TIME` (`HH:MM`), and `DAILY_DRAFT_LIMIT` in `.env`, then start the existing single bot process with `python main.py telegram-bot`. Scheduled preparation only creates queue drafts; it never publishes videos. Public publishing remains a separate `/upload` action and still requires confirmation for each clip.
 
 Set `SCHEDULER_ANALYTICS_ENABLED=true` to send a daily `7d` or `28d` report at `SCHEDULER_ANALYTICS_TIME`. `/pause` prevents new scheduled jobs and pauses pipeline checkpoints; `/resume` allows them again. Set `SCHEDULER_ENABLED=false` to disable the scheduler. Each daily job is durably claimed in `data/scheduler.json` before it starts, so a restart does not repeat that day's job. `SCHEDULER_MAX_ATTEMPTS` bounds recovery to at most three total attempts; only classified transient network, timeout, rate-limit, and server errors are retried. Authentication, quota, model, and configuration failures are not retried automatically.
+
+---
+
+## 🛡️ Duplicate Guard System (`guard.py`)
+Agent ek hi YouTube video se baar-baar clips na banaye aur duplicate scenes repeat na hon, iske liye local guard system shamil kiya gaya hai:
+- **Lifetime Video Consumption**: Ek baar source video claim hone aur clip finalize hone ke baad wo `data/used_videos.json` ledger mein "consumed" mark ho jata hai aur dobara use nahi hota.
+- **Max 4 Clips Per Video**: Har video se maximum 4 clips hi allow hote hain (all runs combined, `MAX_CLIPS_PER_VIDEO=4`).
+- **Scene Overlap & Gap Protection**: Ek hi video ke clips ke beech kam se kam 10 seconds ka gap (`MIN_GAP_SEC=10`) hona lazmi hai; overlapping clips filter ho jate hain aur behtar hook score wale clip ko priority milti hai.
+- **CLI Commands**:
+  - `python guard.py status`: Tracked videos aur unke clips ka status dekhne ke liye.
+  - `python guard.py release <video_id>`: Agar kisi video ko dobara allow karna ho to confirmation ke sath release karne ke liye.

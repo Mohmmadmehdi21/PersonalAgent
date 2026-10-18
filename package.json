@@ -1,0 +1,11 @@
+{
+  "name": "personal-agent",
+  "version": "1.0.0",
+  "description": "YouTube Automated Clipping & Commentary Agent",
+  "scripts": {
+    "dev:safe": "python main.py",
+    "start": "python main.py",
+    "status": "python guard.py status",
+    "test": "python -m unittest discover -s tests -p \"test_*.py\""
+  }
+}

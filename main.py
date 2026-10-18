@@ -58,6 +58,11 @@ from clip import make_clip, write_srt
 from thumb import make_thumb
 from upload import get_service, upload
 from commentary import apply_commentary
+try:
+    import guard
+except Exception as _guard_import_err:
+    print(f"[Guard] warning (ignored): {_guard_import_err}")
+
 from own_content import get_pending_own_video, archive_own_video
 from source import find_popular_video, is_channel_url, video_id_from_url
 try:
@@ -235,6 +240,11 @@ def prepare_stage(source_fallbacks=0):
     os.makedirs(WORK, exist_ok=True)
     os.makedirs(REVIEW_DIR, exist_ok=True)
     state = load_state()
+    try:
+        guard.bootstrap()
+        guard.sync_state(state)
+    except Exception as e:
+        print(f"[Guard] warning (ignored): {e}")
     queue = load_queue()
 
     try:
@@ -402,6 +412,11 @@ def prepare_stage(source_fallbacks=0):
         )
         return
 
+    try:
+        guard.claim(info["id"], url)
+    except Exception as e:
+        print(f"[Guard] warning (ignored): {e}")
+
     # Step B: Transcribe (with caching)
     try:
         from telegram_bot.control import checkpoint
@@ -489,6 +504,11 @@ def prepare_stage(source_fallbacks=0):
     except Exception as control_error:
         if os.getenv("AGENT_CONTROL_TASK_ID"):
             log_warn(f"[Telegram Control] Checkpoint failed safely: {control_error}")
+
+    try:
+        clips = guard.filter_clips(info["id"], clips)
+    except Exception as e:
+        print(f"[Guard] warning (ignored): {e}")
 
     # Do not queue a bad cached/fallback clip. Skip this source and try the next
     # popular unprocessed video from the configured channel (bounded per run).
@@ -774,6 +794,10 @@ def render_stage():
                 item.pop("processing_started_at", None)
                 succeeded_clips.append(item)
                 log_event("task_result", task=f"clip:{item.get('id', key)}", status="success", mode="dry_run")
+                try:
+                    guard.record_clip(item.get("source_id"), item.get("start"), item.get("end"), uploaded=False, dry_run=DRY_RUN)
+                except Exception as e:
+                    print(f"[Guard] warning (ignored): {e}")
             else:
                 if control_task_id:
                     from telegram_bot.control import checkpoint
@@ -819,6 +843,10 @@ def render_stage():
 
                 if item.get("is_own"):
                     archive_own_video(item["source_video_path"])
+                try:
+                    guard.record_clip(item.get("source_id"), item.get("start"), item.get("end"), uploaded=True, dry_run=DRY_RUN)
+                except Exception as e:
+                    print(f"[Guard] warning (ignored): {e}")
 
         except UploadCommittedInterruptedError as committed_error:
             item["status"] = "uploaded"

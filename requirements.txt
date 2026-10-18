@@ -1,4 +1,5 @@
 yt-dlp>=2026.08.19
+brotlicffi
 faster-whisper
 groq
 google-api-python-client
