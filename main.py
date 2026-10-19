@@ -62,6 +62,15 @@ try:
     import guard
 except Exception as _guard_import_err:
     print(f"[Guard] warning (ignored): {_guard_import_err}")
+try:
+    import source_filter
+except Exception as _source_filter_import_err:
+    print(f"[SourceFilter] warning (ignored): {_source_filter_import_err}")
+try:
+    import source_memory
+except Exception as _source_memory_import_err:
+    print(f"[SourceMemory] warning (ignored): {_source_memory_import_err}")
+
 
 from own_content import get_pending_own_video, archive_own_video
 from source import find_popular_video, is_channel_url, video_id_from_url
@@ -124,6 +133,17 @@ def next_source_candidates(state, max_candidates=None):
         max_candidates = YTDLP_MAX_SOURCE_CANDIDATES
     if not os.path.exists("sources.txt"):
         return []
+
+    # Guarded hook: evaluate persistent rejection memory & direct URLs first
+    try:
+        import source_memory
+        if source_memory.is_reject_memory_enabled():
+            selected = source_memory.select_candidates(state, max_candidates=max_candidates)
+            if selected is not None:
+                return selected
+    except Exception as _src_mem_err:
+        print(f"[SourceMemory] warning (ignored): {_src_mem_err}")
+
     state.setdefault("done_videos", [])
     processed_ids = set(state["done_videos"])
     processed_ids.update(state.get("skipped_video_ids", []))
@@ -140,18 +160,20 @@ def next_source_candidates(state, max_candidates=None):
     )
 
     entries = []
-    for line in open("sources.txt", encoding="utf-8"):
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        note = ""
-        if "|" in line:
-            parts = line.split("|", 1)
-            url = parts[0].strip()
-            note = parts[1].strip()
-        else:
-            url = line
-        entries.append((url, note))
+    # FIXED-BUG F002: Ensure sources.txt file handle is cleanly closed via context manager in Windows
+    with open("sources.txt", encoding="utf-8") as _src_file:
+        for line in _src_file:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            note = ""
+            if "|" in line:
+                parts = line.split("|", 1)
+                url = parts[0].strip()
+                note = parts[1].strip()
+            else:
+                url = line
+            entries.append((url, note))
 
     candidates = []
     seen_urls = set()
@@ -317,11 +339,23 @@ def prepare_stage(source_fallbacks=0):
 
     # 3. Select source video candidates
     candidates = next_source_candidates(state, max_candidates=YTDLP_MAX_SOURCE_CANDIDATES)
+    try:
+        candidates = source_filter.filter_candidates(candidates)
+    except Exception as e:
+        print(f"[SourceFilter] warning (ignored): {e}")
     if not candidates:
+        try:
+            import source_memory
+            if source_memory.is_reject_memory_enabled():
+                summary = source_memory.get_exhaustion_summary()
+                if summary:
+                    print(f"[INFO] sources.txt queue exhausted: {summary}.")
+        except Exception:
+            summary = None
         print("[INFO] sources.txt mein koi naya video URL nahi mila.")
         log("[Prepare] sources.txt queue is empty.")
         log_event("task_result", task="prepare:source_selection", status="skipped", reason="no unprocessed source")
-        notify_queue_empty()
+        notify_queue_empty(summary=summary)
         return
 
     # Step A: Download candidate source with multi-candidate fallback
@@ -366,6 +400,12 @@ def prepare_stage(source_fallbacks=0):
             state.setdefault("done", []).append(candidate_url)
             update_step_status(state, cand_vid, "download", "failed", error=str(pse))
             save_state_atomic(state)
+            try:
+                import source_memory
+                if source_memory.is_reject_memory_enabled():
+                    source_memory.mark_rejected(cand_vid, "PRIVATE_OR_DELETED", f"PermanentSourceError: {str(pse)[:200]}", url=candidate_url)
+            except Exception:
+                pass
             print(f"[Skip] Video {candidate_url} unavailable/restricted. Trying next candidate...")
             continue
         except BotVerificationError as bve:
@@ -375,6 +415,12 @@ def prepare_stage(source_fallbacks=0):
             state.setdefault("failed_video_ids", []).append(cand_vid)
             update_step_status(state, cand_vid, "download", "failed", error=str(bve))
             save_state_atomic(state)
+            try:
+                import source_memory
+                if source_memory.is_reject_memory_enabled():
+                    source_memory.mark_transient_failure(cand_vid, f"Bot verification required: {str(bve)[:200]}")
+            except Exception:
+                pass
             print(f"[Auth] Bot verification required for {candidate_url}. Trying next candidate...")
             continue
         except RateLimitedError as rle:
@@ -385,6 +431,12 @@ def prepare_stage(source_fallbacks=0):
             state.setdefault("failed_video_ids", []).append(cand_vid)
             update_step_status(state, cand_vid, "download", "failed", error=str(rle))
             save_state_atomic(state)
+            try:
+                import source_memory
+                if source_memory.is_reject_memory_enabled():
+                    source_memory.mark_transient_failure(cand_vid, f"HTTP 429 Rate Limited: {str(rle)[:200]}")
+            except Exception:
+                pass
             notify_run_error(
                 "download_rate_limit",
                 f"YouTube HTTP 429 Rate Limit. Pausing downloads for {YTDLP_RATE_LIMIT_COOLDOWN_SECONDS}s. "
@@ -400,6 +452,12 @@ def prepare_stage(source_fallbacks=0):
             state.setdefault("failed_video_ids", []).append(cand_vid)
             update_step_status(state, cand_vid, "download", "failed", error=str(e))
             save_state_atomic(state)
+            try:
+                import source_memory
+                if source_memory.is_reject_memory_enabled():
+                    source_memory.mark_transient_failure(cand_vid, f"Download error ({type(e).__name__}): {str(e)[:200]}")
+            except Exception:
+                pass
             print(f"[Notice] Candidate {candidate_url} failed: {e}. Trying next candidate...")
             continue
 
@@ -570,6 +628,12 @@ def prepare_stage(source_fallbacks=0):
         state.setdefault("videos", {}).setdefault(video_id, {})["status"] = "skipped_no_usable_clips"
         save_queue(queue)
         save_state_atomic(state)
+        try:
+            import source_memory
+            if source_memory.is_reject_memory_enabled():
+                source_memory.mark_rejected(video_id, "NO_USABLE_CLIPS", "Video had no usable 25-60 second commentary clips", url=info.get("url", url), title=info.get("title"))
+        except Exception:
+            pass
         log_warn(f"[Prepare] {video_id} had no usable 25-60 second clips; trying another channel video.")
         print(f"[Skip] {video_id} mein usable clip nahi mili. Channel se agla popular video try kar rahe hain.")
         if source_fallbacks < 4:
@@ -634,7 +698,11 @@ def prepare_stage(source_fallbacks=0):
             log_warn(f"[Telegram Control] Could not associate prepared clips: {control_error}")
     _monitor_progress("prepare", "drafts queued", message=f"Preparation complete: {new_drafts} clip draft(s) queued.")
     print("\n" + "=" * 65)
-    print(f"[SUCCESS] {new_drafts} commentary clip drafts saved to 'review/queue.json'!")
+    # FIXED-BUG F001: Misleading success message when 0 drafts were saved
+    if new_drafts > 0:
+        print(f"[SUCCESS] {new_drafts} commentary clip drafts saved to 'review/queue.json'!")
+    else:
+        print(f"[INFO] 0 new commentary clip drafts saved (all clips already queued or duplicate).")
     print("-> Drafts queue mein hain; normal 'python main.py' run unhe automatically process karega.")
     print("=" * 65 + "\n")
 

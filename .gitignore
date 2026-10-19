@@ -44,6 +44,19 @@ logs/
 *.log
 review/
 *.tmp
+*.bak*
+data/*.json
+data/*.bak*
+!data/.gitkeep
+
+# Scratch & Intermediate Outputs
+mrbeast_15min_plus.txt
+mrbeast_15min_plus_details.csv
+remove.txt
+barrier.txt
+proposed_changes.txt
+diagnosis.txt
+project-architecture.svg
 
 # System Files
 .DS_Store

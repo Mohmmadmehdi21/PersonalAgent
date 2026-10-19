@@ -304,6 +304,11 @@ def find_clips(transcript, duration, n=2, previous_commentaries=None, previous_t
     # Simple cache check
     if video_id:
         clips_cache = os.path.join(WORK, f"{video_id}.clips.json").replace("\\", "/")
+        try:
+            import source_filter
+            source_filter.validate_cache_file(clips_cache, duration)
+        except Exception as _sf_err:
+            print(f"[SourceFilter] warning (ignored): {_sf_err}")
         if os.path.isfile(clips_cache) and os.path.getsize(clips_cache) > 0:
             try:
                 with open(clips_cache, "r", encoding="utf-8") as f:

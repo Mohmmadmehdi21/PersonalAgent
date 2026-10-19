@@ -165,11 +165,13 @@ def notify_quota_or_auth(error_type, details):
     )
     broadcast_message(subject, body)
 
-def notify_queue_empty():
+def notify_queue_empty(summary=None):
+    # FIXED-BUG F003: Support accurate exhaustion summary in Telegram notification while preserving backwards compatibility
     subject = "ℹ️ YouTube Agent: Queue Khali Hai"
+    detail_line = f"\nChecked summary: {summary}\n" if summary else ""
     body = (
         "ℹ️ <b>Queue Khali Hai</b>\n\n"
-        "sources.txt mein koi naya unprocessed video URL nahi mila.\n"
+        f"sources.txt mein koi naya unprocessed video URL nahi mila.{detail_line}\n"
         "Kripya sources.txt mein naye video URLs ya channel link add karein."
     )
     broadcast_message(subject, body)
