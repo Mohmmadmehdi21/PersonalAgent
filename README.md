@@ -146,6 +146,8 @@ uses pagination and returns at most 20 recent uploads. Reports are live and are 
 
 The Telegram bot can run a once-per-day preparation job and an optional analytics report. Configure `SCHEDULER_ENABLED=true`, `SCHEDULER_TIMEZONE` (IANA name), `SCHEDULER_PREPARE_TIME` (`HH:MM`), and `DAILY_DRAFT_LIMIT` in `.env`, then start the existing single bot process with `python main.py telegram-bot`. Scheduled preparation only creates queue drafts; it never publishes videos. Public publishing remains a separate `/upload` action and still requires confirmation for each clip.
 
+Optional daily source refresh can run before preparation. Set `SCHEDULER_SOURCE_REFRESH_ENABLED=true` and `SCHEDULER_SOURCE_REFRESH_TIME=08:00` (earlier than `SCHEDULER_PREPARE_TIME`). The scheduler runs `make_sources.py`, then `merge_sources.py` to append only eligible, unseen links to `sources.txt`, and only starts that day's scheduled preparation after the refresh succeeds. A failed refresh is retried under `SCHEDULER_MAX_ATTEMPTS`; it does not start preparation from a stale source list. Keep the Telegram bot process running for scheduled jobs to run.
+
 Set `SCHEDULER_ANALYTICS_ENABLED=true` to send a daily `7d` or `28d` report at `SCHEDULER_ANALYTICS_TIME`. `/pause` prevents new scheduled jobs and pauses pipeline checkpoints; `/resume` allows them again. Set `SCHEDULER_ENABLED=false` to disable the scheduler. Each daily job is durably claimed in `data/scheduler.json` before it starts, so a restart does not repeat that day's job. `SCHEDULER_MAX_ATTEMPTS` bounds recovery to at most three total attempts; only classified transient network, timeout, rate-limit, and server errors are retried. Authentication, quota, model, and configuration failures are not retried automatically.
 
 ---

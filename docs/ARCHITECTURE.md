@@ -45,6 +45,8 @@ python main.py
 
 CLI commands include `prepare`, `render`, `cleanup [--dry]`, and the optional growth commands `stats`, `slots`, `learn`, `comments`, `growth-health`. The growth commands dispatch before the media pipeline imports, so they do not need Whisper/FFmpeg imports. The default run does prepare then render; `prepare` alone only queues work, while `render` consumes existing queue work.
 
+The optional Telegram scheduler can also refresh the curated long-video source list once per day before scheduled preparation. When `SCHEDULER_SOURCE_REFRESH_ENABLED=true`, it runs `make_sources.py`, appends eligible unseen links through `merge_sources.py`, then launches that day's prepare task only after refresh succeeds. This refresh is opt-in and does not publish videos.
+
 ## Queue, state, and caches
 
 - `review/queue.json` is a JSON list of clip dictionaries. `queue_manager.py` validates and atomically replaces it, archives prior bytes before changed writes, safely migrates legacy statuses, and preserves corrupt/unknown data. Recovery steps are in [QUEUE_RECOVERY.md](QUEUE_RECOVERY.md).

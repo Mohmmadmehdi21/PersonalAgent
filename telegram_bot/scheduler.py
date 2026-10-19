@@ -1,6 +1,8 @@
 """Persistent, once-per-day Telegram bot scheduler; never performs public uploads."""
 import json
 import os
+import subprocess
+import sys
 import threading
 import time
 from datetime import datetime, timedelta
@@ -69,6 +71,8 @@ class Scheduler:
         except ZoneInfoNotFoundError:
             raise ValueError("SCHEDULER_TIMEZONE must be a valid IANA timezone (for example Asia/Kolkata).") from None
         self.prepare_time = _clock("SCHEDULER_PREPARE_TIME", "09:00")
+        self.source_refresh_enabled = _enabled("SCHEDULER_SOURCE_REFRESH_ENABLED")
+        self.source_refresh_time = _clock("SCHEDULER_SOURCE_REFRESH_TIME", "08:00")
         self.analytics_time = _clock("SCHEDULER_ANALYTICS_TIME", "10:00")
         self.analytics_enabled = _enabled("SCHEDULER_ANALYTICS_ENABLED")
         self.daily_draft_limit = _positive_int("DAILY_DRAFT_LIMIT", 2, 4)
@@ -139,6 +143,27 @@ class Scheduler:
             raise RuntimeError("Telegram analytics report could not be delivered.")
         return "sent"
 
+    def _source_refresh_job(self):
+        """Refresh the curated long-video dataset, then append only unseen sources."""
+        commands = (
+            (sys.executable, "make_sources.py"),
+            (sys.executable, "merge_sources.py"),
+        )
+        outputs = []
+        for command in commands:
+            try:
+                result = subprocess.run(
+                    command, check=False, capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=60 * 60,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError(f"{command[1]} timed out after one hour.") from exc
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or "No details returned.").strip()
+                raise RuntimeError(f"{command[1]} exited with code {result.returncode}: {detail[-1200:]}")
+            outputs.append((result.stdout or "").strip())
+        return "\n".join(line for line in outputs if line)
+
     def _paused(self):
         try:
             from telegram_bot.control import _read as read_control
@@ -196,6 +221,9 @@ class Scheduler:
             if kind == "analytics":
                 result = self.analytics_job(period)
                 state["jobs"][key].update(status="completed", result=str(result), finished_at=now_ts)
+            elif kind == "source_refresh":
+                result = self._source_refresh_job()
+                state["jobs"][key].update(status="completed", result=str(result)[-2000:], finished_at=now_ts)
             else:
                 remaining = max(0, self.daily_draft_limit - len(state["jobs"][key].get("draft_ids", [])))
                 if remaining == 0:
@@ -225,6 +253,10 @@ class Scheduler:
                 elif now_ts - float(row.get("started_at", now_ts)) > 120:
                     row.update(status="failed", failed_at=now_ts, retryable=True,
                                error="Interrupted before task ID was recorded; no matching worker task exists.")
+            if (row.get("status") == "starting" and row.get("kind") == "source_refresh"
+                    and now_ts - float(row.get("started_at", now_ts)) > 3600):
+                row.update(status="failed", failed_at=now_ts, retryable=True,
+                           error="Interrupted during source refresh; it is safe to retry.")
             if row.get("status") == "failed" and row.get("retryable"):
                 scheduled = row.get("scheduled_key", "")
                 # Only retry when this scheduled day is still current, avoiding stale catch-up storms.
@@ -249,9 +281,13 @@ class Scheduler:
             return
         if not self._paused():
             date_key = local.strftime("%Y-%m-%d")
+            if self.source_refresh_enabled and (local.hour, local.minute) >= self.source_refresh_time:
+                self._run_due(state, f"sources:{date_key}", "source_refresh", None, timestamp)
             prepare_due = (local.hour, local.minute) >= self.prepare_time
             if prepare_due:
-                self._run_due(state, f"prepare:{date_key}", "prepare", None, timestamp)
+                refresh = state["jobs"].get(f"sources:{date_key}")
+                if not self.source_refresh_enabled or (refresh and refresh.get("status") == "completed"):
+                    self._run_due(state, f"prepare:{date_key}", "prepare", None, timestamp)
             if self.analytics_enabled and (local.hour, local.minute) >= self.analytics_time:
                 period = os.getenv("SCHEDULER_ANALYTICS_RANGE", "7d").strip()
                 if period in {"7d", "28d"}:
@@ -284,9 +320,13 @@ def _retryable(error, kind):
     """Retry only known transient read/preparation failures, never auth/quota/config errors."""
     try:
         from retry import classify_error
-        classification = classify_error(RuntimeError(str(error)),
-                                        service="youtube" if kind == "analytics" else "groq",
-                                        operation="read" if kind == "analytics" else "generate")
+        if kind == "analytics":
+            service, operation = "youtube", "read"
+        elif kind == "source_refresh":
+            service, operation = "download", "download"
+        else:
+            service, operation = "groq", "generate"
+        classification = classify_error(RuntimeError(str(error)), service=service, operation=operation)
         return classification.retryable and classification.category in {
             "network", "timeout", "transient_http", "rate_limited"
         }
