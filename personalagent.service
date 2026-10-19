@@ -1,0 +1,27 @@
+[Unit]
+Description=PersonalAgent Telegram Control Bot and Pipeline
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/PersonalAgent
+EnvironmentFile=/home/ubuntu/PersonalAgent/.env
+ExecStart=/home/ubuntu/PersonalAgent/.venv/bin/python main.py telegram-bot
+Restart=always
+RestartSec=15
+KillMode=mixed
+TimeoutStopSec=30
+
+# Resource limits to protect free-tier VM stability
+LimitNOFILE=65536
+
+# Standard output and error to systemd journal
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=personalagent
+
+[Install]
+WantedBy=multi-user.target

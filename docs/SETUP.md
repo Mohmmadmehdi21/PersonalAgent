@@ -2,7 +2,7 @@
 
 ## Runtime and dependencies
 
-- Use Python **3.11 or newer**. The scheduled workflow currently selects Python 3.11; Phase 3 checks were run with Python 3.13. End-to-end media/API behavior was not exercised here.
+- Use Python **3.13.7** for the local Windows environment (`.python-version`), GitHub Actions workflow, and Docker image. The runtime now installs dependencies into an isolated environment; do not add another environment's `site-packages` to `PYTHONPATH`.
 - Install Python packages with `python -m pip install -r requirements.txt`.
 - Install FFmpeg and make `ffmpeg` available on `PATH`. On Windows, yt-dlp may also require Deno for some YouTube player challenges; install it and make `deno` available on `PATH` if downloads report that requirement.
 - `requirements.txt` currently lists direct dependencies without version pins. This intentionally avoids untested upgrades/downgrades in the existing pipeline. For a deployment, create and review a platform-specific lock file after validating the full media pipeline on that platform.
@@ -37,7 +37,7 @@ The project/API and model names can be checked locally for presence and basic fi
 3. Run `python test_auth.py` or start the requested pipeline command. Browser consent creates/refreshes `token.json`. Do not delete or copy this token into `token_growth.json`.
 4. Growth commands prompt separately when the additional read/comment/Sheets scope is needed and store that grant in `token_growth.json`.
 
-Live `run`/`render` validates that an OAuth token or OAuth client file exists when `DRY_RUN=false`. Channel-source discovery may also require YouTube OAuth during preparation, even when rendering is dry-run.
+Live `run`/`render` validates that an OAuth token or OAuth client file exists when `DRY_RUN=false`. Channel URLs in `sources.txt` also need OAuth for YouTube Data API discovery; direct video URLs do not.
 
 ## Notification setup
 

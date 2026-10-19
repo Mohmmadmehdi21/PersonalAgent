@@ -2,7 +2,7 @@
 
 For installation, secure credentials, Google OAuth/ADC separation, and runtime requirements, see [docs/SETUP.md](docs/SETUP.md).
 
-Channel/video source -> Whisper transcript -> Groq clip & commentary drafts -> subtitles, commentary cards & Edge-TTS voiceover -> thumbnail -> automatic YouTube upload.
+Channel/video source -> Whisper transcript -> Groq clip & commentary drafts -> subtitles, commentary cards & Edge-TTS voiceover -> thumbnail. Live YouTube publishing is available through the owner-authorized Telegram `/upload` flow and requires per-clip confirmation.
 
 ## Groq API Setup
 
@@ -86,13 +86,13 @@ Disk safai sirf tab execute hoti hai jab us video ke saare clips upload (ya DRY_
 ## 🛠️ CLI Commands Cheatsheet
 
 ```bash
-# 1. Full Automated Run (Prepare -> Auto-render/upload -> Cleanup -> Notify)
+# 1. Prepare and render locally; live upload requires Telegram owner confirmation
 python main.py
 
 # 2. Stage 1: Sirf Prepare (Download, Whisper, Groq drafting)
 python main.py prepare
 
-# 3. Stage 2: Pending Clips Auto-render & Upload
+# 3. Stage 2: Pending clips render; live publishing is restricted to Telegram confirmation
 python main.py render
 
 # 5. Disk Cleanup Preview

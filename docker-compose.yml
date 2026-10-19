@@ -1,0 +1,34 @@
+version: "3.8"
+
+services:
+  personalagent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: personalagent:latest
+    container_name: personalagent-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Persistent application state (used videos, rejection memory, scheduler state)
+      - ./data:/app/data
+      # Durable duplicate guard and pipeline progress state
+      - ./state.json:/app/state.json
+      # Clip queue and rendered assets awaiting upload/review
+      - ./review:/app/review
+      # Structured logs and Telegram control task logs
+      - ./logs:/app/logs
+      # Temporary download, audio transcription, and lock directory
+      - ./work:/app/work
+      # Mount Google OAuth credentials if present locally
+      - ./client_secret.json:/app/client_secret.json:ro
+      - ./token.json:/app/token.json
+      - ./token_growth.json:/app/token_growth.json
+    environment:
+      - PYTHONUNBUFFERED=1
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
