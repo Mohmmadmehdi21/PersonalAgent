@@ -2,10 +2,12 @@ import os, glob, json
 import re
 from pathlib import Path
 try:
-    from dotenv import load_dotenv
+    import dotenv  # noqa: F401
 except ImportError as exc:
     raise RuntimeError("python-dotenv is required; install project dependencies with 'python -m pip install -r requirements.txt'.") from exc
-load_dotenv()
+from env_config import load_project_env
+
+load_project_env()
 
 
 class ConfigurationError(ValueError):
@@ -119,18 +121,33 @@ def validate_startup_config(command="run"):
     if command == "cleanup":
         return []
 
+    load_project_env()
+
     errors = []
     warnings = []
+
+    def configured(name):
+        value = os.getenv(name, "").strip()
+        return bool(value) and not value.lower().startswith(("your_", "replace_", "<"))
+
+    if command == "telegram-bot":
+        if not configured("TELEGRAM_BOT_TOKEN"):
+            errors.append("TELEGRAM_BOT_TOKEN is required to run the Telegram control bot.")
+        try:
+            from telegram_bot.access import get_owner_ids
+            get_owner_ids()
+        except Exception as exc:
+            errors.append(f"TELEGRAM_OWNER_IDS is required and must be valid: {exc}")
+        if errors:
+            raise ConfigurationError("Startup configuration is incomplete:\n- " + "\n- ".join(errors))
+        return warnings
+
     channels = [part.strip().lower() for part in NOTIFY_CHANNEL.split(",") if part.strip()]
     unknown_channels = sorted(set(channels) - {"none", "telegram", "email"})
     if unknown_channels:
         errors.append("NOTIFY_CHANNEL supports only none, telegram, and email.")
     if "none" in channels and len(channels) > 1:
         errors.append("NOTIFY_CHANNEL=none cannot be combined with another notification channel.")
-
-    def configured(name):
-        value = os.getenv(name, "").strip()
-        return bool(value) and not value.lower().startswith(("your_", "replace_", "<"))
 
     if "telegram" in channels:
         if not configured("TELEGRAM_BOT_TOKEN"):
@@ -162,7 +179,8 @@ def validate_startup_config(command="run"):
     if cookies_file and not Path(cookies_file).expanduser().is_file():
         warnings.append(f"YTDLP_COOKIES_FILE is set but file was not found: {cookies_file}")
 
-    # Channel discovery needs YouTube OAuth even during DRY_RUN; live render always does.
+    # Channel discovery uses the YouTube Data API; source duration filtering
+    # itself stays non-interactive and does not request OAuth.
     source_text = ""
     try:
         source_text = Path("sources.txt").read_text(encoding="utf-8").lower()

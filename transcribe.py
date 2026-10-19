@@ -1,7 +1,34 @@
 import os, json, hashlib, math, tempfile, time
+from contextlib import contextmanager
 from faster_whisper import WhisperModel
 from config import WHISPER_MODEL
 from state_manager import is_valid_json_file
+
+
+@contextmanager
+def _pyav_open_compat(av_module=None):
+    """Bridge faster-whisper 1.2.1's removed PyAV 19 keyword at this call boundary.
+
+    PyAV 19 removed metadata_errors; metadata is now decoded with UTF-8/surrogateescape.
+    Older PyAV versions retain the explicit ignore behavior expected by faster-whisper.
+    """
+    if av_module is None:
+        import av as av_module
+    major = int(str(getattr(av_module, "__version__", "0")).split(".", 1)[0])
+    if major < 19:
+        yield
+        return
+    original_open = av_module.open
+
+    def compatible_open(*args, **kwargs):
+        kwargs.pop("metadata_errors", None)
+        return original_open(*args, **kwargs)
+
+    av_module.open = compatible_open
+    try:
+        yield
+    finally:
+        av_module.open = original_open
 
 
 def _atomic_json(path, payload):
@@ -72,7 +99,11 @@ def transcribe(path):
         print(f"[Transcribe] GPU unavailable ({type(e).__name__}). Using CPU (int8).")
         model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
 
-    segments, info = model.transcribe(path, vad_filter=True, word_timestamps=True)
+    # faster-whisper 1.2.1 still passes metadata_errors to av.open. Remove that
+    # obsolete kwarg only on PyAV 19+, where it was removed and is no longer needed.
+    import av
+    with _pyav_open_compat(av):
+        segments, info = model.transcribe(path, vad_filter=True, word_timestamps=True)
     total_duration = info.duration if info and info.duration else 0
 
     results = []

@@ -46,6 +46,8 @@ def begin_run(path=MONITOR_FILE, pid=None):
         "running": True, "pid": int(pid or os.getpid()), "stage": "starting",
         "current_task": "initializing", "run_started_at": _now(), "run_failures": 0,
         "run_results": [], "updated_at": _now(),
+        "run_publications": 0,
+        "run_publication_visibility": "none",
     })
     _write_registry(data, path)
     return data
@@ -74,6 +76,8 @@ def record_event(event, fields, path=MONITOR_FILE):
         for key in ("error_category", "error", "mode"):
             if key in safe:
                 result[key] = str(safe[key])[:300]
+        if "privacy_status" in safe:
+            result["privacy_status"] = str(safe["privacy_status"])[:30]
         results = list(data.get("task_results", []))
         results.append(result)
         data["task_results"] = results[-TASK_RESULTS_LIMIT:]
@@ -83,7 +87,19 @@ def record_event(event, fields, path=MONITOR_FILE):
             data["run_results"] = run_results[-TASK_RESULTS_LIMIT:]
             if result["status"] in {"failure", "uncertain", "interrupted"}:
                 data["run_failures"] = int(data.get("run_failures", 0)) + 1
-        if any(word in result["task"].lower() for word in ("api", "upload", "comment insert")):
+            if (result["status"] == "success" and safe.get("youtube_video_id")
+                    and safe.get("privacy_status") == "public"):
+                data["run_publications"] = int(data.get("run_publications", 0)) + 1
+                data["last_publication_at"] = result["at"]
+                data["last_publication_visibility"] = "public"
+                data["run_publication_visibility"] = "public"
+        elif (result["status"] == "success" and safe.get("youtube_video_id")
+              and safe.get("privacy_status") == "public"):
+            data["last_publication_at"] = result["at"]
+            data["last_publication_visibility"] = "public"
+        if (any(word in result["task"].lower() for word in ("api", "upload", "comment insert"))
+                or safe.get("youtube_video_id")
+                or result.get("error_category") in {"account_upload_limit", "youtube_quota", "upload_outcome_unknown", "authentication"}):
             data["last_api_response"] = {
                 "at": result["at"], "task": result["task"],
                 "status": result["status"], "category": result.get("error_category", ""),
@@ -101,9 +117,16 @@ def finish_run(outcome=None, error=None, path=MONITOR_FILE):
     data = read_registry(path)
     if outcome is None:
         outcome = "failed" if int(data.get("run_failures", 0)) else "completed"
+    if outcome == "failed":
+        failed_stage = data.get("current_task") or data.get("stage")
+        if failed_stage and str(failed_stage).lower() != "idle":
+            data["last_failed_stage"] = str(failed_stage)[:120]
     data.update({"running": False, "pid": None, "stage": "idle", "current_task": None,
-                 "last_run_status": outcome, "last_run_finished_at": _now(), "updated_at": _now()})
-    if error:
+                 "last_run_status": outcome, "last_run_finished_at": _now(),
+                 "last_run_publications": int(data.get("run_publications", 0)),
+                 "last_run_publication_visibility": data.get("run_publication_visibility", "none"),
+                 "updated_at": _now()})
+    if error and not data.get("last_error"):
         safe = mask_secrets(error)
         data["last_error"] = {"at": _now(), "task": "main", "category": "unhandled",
                               "message": safe[:300]}
@@ -112,7 +135,8 @@ def finish_run(outcome=None, error=None, path=MONITOR_FILE):
 
 
 def recent_logs(limit=8):
-    files = sorted(LOG_DIR.glob("run_*.log"), key=lambda file: file.stat().st_mtime, reverse=True)
+    files = sorted([f for f in LOG_DIR.glob("*.log") if not f.name.endswith(".lock")],
+                   key=lambda file: file.stat().st_mtime, reverse=True)
     if not files:
         return ["No run logs found."]
     try:
@@ -123,16 +147,27 @@ def recent_logs(limit=8):
 
 
 def integration_status():
-    youtube = "configured" if Path("token.json").is_file() or Path("client_secret.json").is_file() else "missing credentials"
-    growth_google = "configured" if Path("token_growth.json").is_file() else "not configured"
-    adc = bool(os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip() or
-               (os.getenv("GOOGLE_CLOUD_PROJECT", "").strip() and os.getenv("GOOGLE_CLOUD_LOCATION", "").strip()))
+    youtube = ("credentials present; connectivity not tested" if Path("token.json").is_file() or Path("client_secret.json").is_file()
+               else "credentials missing")
+    growth_google = ("credentials present; connectivity not tested" if Path("token_growth.json").is_file()
+                     else "not configured")
+    adc_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+    adc_configured = any(os.getenv(key, "").strip() for key in
+                         ("GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION", "VERTEX_AI_MODEL", "GOOGLE_APPLICATION_CREDENTIALS"))
+    try:
+        default_adc = Path.home() / ".config" / "gcloud" / "application_default_credentials.json"
+    except (OSError, RuntimeError):
+        default_adc = Path("__missing_home__") / "application_default_credentials.json"
+    adc_present = bool((adc_path and Path(adc_path).expanduser().is_file()) or default_adc.is_file())
+    adc = ("not required (Agent Platform not configured)" if not adc_configured else
+           "credentials present; connectivity not tested" if adc_present else
+           "required by Agent Platform configuration but missing")
     return {
         "telegram": "online (this bot is polling)",
         "youtube": youtube,
         "google_growth": growth_google,
-        "google_cloud_adc": "configured" if adc else "not configured",
-        "note": "Credential presence only; external API connectivity/permissions are not probed.",
+        "google_cloud_adc": adc,
+        "note": "Credential presence is separate from connectivity; no external API probes were made.",
     }
 
 

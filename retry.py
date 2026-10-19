@@ -9,7 +9,7 @@ import time
 from functools import lru_cache
 from dataclasses import dataclass
 
-from logger import log_error, log_event, log_warn
+from logger import log_error, log_event, log_warn, mask_secrets
 
 
 class FatalError(Exception):
@@ -55,8 +55,9 @@ class ExternalWriteOutcomeUnknownError(FatalError):
 class UploadCommittedInterruptedError(FatalError):
     """Upload is confirmed, but interruption occurred during a later side effect."""
 
-    def __init__(self, video_id):
+    def __init__(self, video_id, privacy_status=None):
         self.video_id = video_id
+        self.privacy_status = privacy_status
         super().__init__(f"Upload {video_id} succeeded, then processing was interrupted.")
 
 
@@ -126,6 +127,41 @@ def youtube_error_reasons(err):
         except (TypeError, ValueError, AttributeError):
             pass
     return reasons
+
+
+def youtube_error_details(err):
+    """Return bounded structured YouTube error context without request credentials."""
+    status_code = _status_code(err)
+    payload = None
+    content = getattr(err, "content", None)
+    if content:
+        try:
+            if isinstance(content, bytes):
+                content = content.decode("utf-8", errors="replace")
+            payload = json.loads(content) if isinstance(content, str) else content
+        except (TypeError, ValueError):
+            payload = None
+    api_error = payload.get("error", {}) if isinstance(payload, dict) else {}
+    entries = api_error.get("errors", []) if isinstance(api_error, dict) else []
+    raw_entries = getattr(err, "error_details", None)
+    if not isinstance(entries, list):
+        entries = []
+    if isinstance(raw_entries, (list, tuple)):
+        entries = entries + [x for x in raw_entries if isinstance(x, dict)]
+    details = []
+    for entry in entries[:5]:
+        if not isinstance(entry, dict):
+            continue
+        safe = {key: mask_secrets(str(entry[key]))[:200] for key in ("domain", "reason", "message", "location", "locationType")
+                if entry.get(key) is not None}
+        if safe and safe not in details:
+            details.append(safe)
+    return {
+        "http_status": status_code,
+        "api_status": str(api_error.get("status", ""))[:100] if isinstance(api_error, dict) else "",
+        "api_message": mask_secrets(str(api_error.get("message", "")))[:300] if isinstance(api_error, dict) else "",
+        "details": details,
+    }
 
 
 def parse_retry_after(value):

@@ -6,9 +6,11 @@ import threading
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import deque
 from pathlib import Path
 
-from telegram_bot.access import AccessConfigurationError, parse_owner_ids
+from env_config import load_project_env
+from telegram_bot.access import AccessConfigurationError, get_owner_ids, parse_owner_ids
 from telegram_bot.commands import handle_update
 
 LOCK_PATH = Path("work/telegram_polling.lock")
@@ -81,15 +83,11 @@ def _api_call(token, method, params=None, timeout=40):
 def run_bot(*, token=None, owner_ids_raw=None, api_call=None, reply_sender=None, lock=None,
             sleep=time.sleep, stop_requested=None):
     """Run until interrupted; injected API and sender allow offline tests."""
-    try:
-        from dotenv import load_dotenv
-        load_dotenv()
-    except ImportError:
-        pass
+    load_project_env()
     token = (token if token is not None else os.getenv("TELEGRAM_BOT_TOKEN", "")).strip()
     if not token:
         raise AccessConfigurationError("Set TELEGRAM_BOT_TOKEN before starting the Telegram bot.")
-    owner_ids = parse_owner_ids(owner_ids_raw if owner_ids_raw is not None else os.getenv("TELEGRAM_OWNER_IDS", ""))
+    owner_ids = parse_owner_ids(owner_ids_raw) if owner_ids_raw is not None else get_owner_ids()
     api_call = api_call or _api_call
     if reply_sender is None:
         from notify import send_telegram_to
@@ -97,7 +95,14 @@ def run_bot(*, token=None, owner_ids_raw=None, api_call=None, reply_sender=None,
     lock = lock or PollLock()
     if not lock.acquire():
         raise RuntimeError("Another Telegram polling process is already active, or its lock cannot be verified.")
+    try:
+        from telegram_bot.control import reconcile_tasks
+        reconcile_tasks()
+    except Exception:
+        pass
     offset = None
+    answered_callbacks = set()
+    callback_order = deque()
     scheduler_stop = threading.Event()
     scheduler_thread = None
     try:
@@ -110,19 +115,52 @@ def run_bot(*, token=None, owner_ids_raw=None, api_call=None, reply_sender=None,
             scheduler_thread.start()
         while not (stop_requested and stop_requested()):
             try:
-                params = {"timeout": 30, "allowed_updates": json.dumps(["message", "edited_message"])}
+                params = {"timeout": 30, "allowed_updates": json.dumps(["message", "edited_message", "callback_query"])}
                 if offset is not None:
                     params["offset"] = offset
                 updates = api_call(token, "getUpdates", params, 40) or []
                 for update in updates:
                     offset = int(update.get("update_id", 0)) + 1
+                    callback = update.get("callback_query") if isinstance(update, dict) else None
+                    callback_id = callback.get("id") if isinstance(callback, dict) else None
+                    if callback_id and callback_id in answered_callbacks:
+                        try:
+                            api_call(token, "answerCallbackQuery", {"callback_query_id": callback_id,
+                                                                      "text": "This button was already handled."}, 10)
+                        except Exception:
+                            pass
+                        continue
                     try:
                         reply = handle_update(update, owner_ids)
+                        if callback_id:
+                            answered_callbacks.add(callback_id)
+                            callback_order.append(callback_id)
+                            if len(callback_order) > 512:
+                                answered_callbacks.discard(callback_order.popleft())
+                            try:
+                                api_call(token, "answerCallbackQuery", {"callback_query_id": callback_id}, 10)
+                            except Exception:
+                                # A callback response must not stop polling or expose callback data.
+                                try:
+                                    from logger import log_warn
+                                    log_warn("[Telegram] Could not acknowledge an inline button callback.")
+                                except Exception:
+                                    pass
                         if reply:
-                            chat_id, text = reply
-                            reply_sender(chat_id, text)
+                            chat_id, text = reply[:2]
+                            markup = reply[2] if len(reply) > 2 else None
+                            if markup:
+                                reply_sender(chat_id, text, reply_markup=markup)
+                            else:
+                                reply_sender(chat_id, text)
                     except Exception:
                         # One bad update cannot stop polling or leak the incoming payload.
+                        if callback_id:
+                            try:
+                                api_call(token, "answerCallbackQuery", {"callback_query_id": callback_id,
+                                                                          "text": "Unable to process this button."}, 10)
+                            except Exception:
+                                pass
                         continue
             except RuntimeError as exc:
                 if str(exc) == "polling_conflict":

@@ -1,4 +1,4 @@
-import os, json, time, subprocess, shutil, glob
+import os, json, time, subprocess, shutil, glob, tempfile
 from logger import log, log_warn, log_error
 
 STATE_FILE = "state.json"
@@ -55,36 +55,43 @@ def is_valid_media_file(file_path):
         return False
 
 def load_state():
-    """Loads state.json. Returns default structure if missing or corrupt."""
+    """Load state, defaulting only when absent; corrupt state must not be overwritten."""
     if not os.path.exists(STATE_FILE):
         return {"done": [], "clips": [], "done_videos": [], "videos": {}}
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            data.setdefault("done", [])
-            data.setdefault("clips", [])
-            data.setdefault("done_videos", [])
-            data.setdefault("videos", {})
-            return data
+        if not isinstance(data, dict):
+            raise ValueError("state root must be a JSON object")
+        data.setdefault("done", [])
+        data.setdefault("clips", [])
+        data.setdefault("done_videos", [])
+        data.setdefault("videos", {})
+        return data
     except Exception as e:
-        log_warn(f"[State] state.json reading failed ({e}). Returning fresh state structure.")
-        return {"done": [], "clips": [], "done_videos": [], "videos": {}}
+        log_error(f"[State] state.json could not be read safely; preserving it and stopping: {e}")
+        raise RuntimeError("state.json is invalid; it was preserved. Restore a valid backup before continuing.") from e
 
 def save_state_atomic(state):
     """Atomically writes state to state.json via temporary file replace to prevent corruption."""
-    tmp_file = STATE_FILE + ".tmp"
+    target = os.path.abspath(STATE_FILE)
+    parent = os.path.dirname(target) or "."
+    fd, tmp_file = tempfile.mkstemp(prefix=".state-", suffix=".tmp", dir=parent)
     try:
-        with open(tmp_file, "w", encoding="utf-8") as f:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2, ensure_ascii=False)
-        os.replace(tmp_file, STATE_FILE)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_file, target)
     except Exception as e:
         log_error(f"[State] Atomic state save error: {e}")
-        # Fallback to direct write
-        try:
-            with open(STATE_FILE, "w", encoding="utf-8") as f:
-                json.dump(state, f, indent=2, ensure_ascii=False)
-        except Exception:
-            pass
+        raise RuntimeError("state.json could not be saved atomically; the previous file was preserved.") from e
+    finally:
+        if os.path.exists(tmp_file):
+            try:
+                os.unlink(tmp_file)
+            except OSError:
+                pass
 
 def init_video_state(state, video_id, url, title="", note=""):
     """Initializes or retrieves state tracking dict for a video source."""

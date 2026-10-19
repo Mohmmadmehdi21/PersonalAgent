@@ -3,11 +3,9 @@ import json
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
+from env_config import load_project_env
+
+load_project_env()
 
 
 def _stats():

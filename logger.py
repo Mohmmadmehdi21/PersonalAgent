@@ -18,11 +18,13 @@ SENSITIVE_PATTERNS = [
     re.compile(r"(client_secret[=:][\s'\"]*)([A-Za-z0-9_-]{20,})"), # Client secret
     re.compile(r"(password[=:][\s'\"]*)([^\s'\"]{6,})", re.I),     # Passwords
     re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/-]+=*"),              # Authorization headers
-    re.compile(r"(?i)((?:api[_-]?key|access[_-]?token|refresh[_-]?token|bot[_-]?token|client[_-]?secret|password|private[_-]?key|chat[_-]?id)[\"']?\s*[:=]\s*[\"']?)[^\s,;\"']+"),
+    re.compile(r"(?i)((?:api[_-]?key|token|access[_-]?token|refresh[_-]?token|bot[_-]?token|client[_-]?secret|password|private[_-]?key|chat[_-]?id)[\"']?\s*[:=]\s*[\"']?)[^\s,;\"']+"),
     re.compile(r"(?i)(https?://api\.telegram\.org/bot)[^/\s]+"),
     re.compile(r"(?i)(?:[A-Z]:[\\/]|/)[^\s\"'<>]*(?:token(?:_growth)?\.json|client_secret\.json|service[-_]account[^\s\"'<>]*\.json|cookies?[^\s\"'<>]*(?:\.txt)?)"),
     re.compile(r"(?i)(?:[A-Z]:[\\/]|\\\\[^\\/\s]+[\\/][^\\/\s]+[\\/])[^\s\"'<>]*"),
-    re.compile(r"(?<![A-Za-z0-9:/])/(?:[^/\s\"'<>]+/)*[^/\s\"'<>]*"),
+    # Require a path separator after the leading slash; this keeps Telegram
+    # commands such as /task, /help, and /status intact.
+    re.compile(r"(?<![A-Za-z0-9:/])/(?:[^/\s\"'<>]+/)+[^/\s\"'<>]+"),
 ]
 
 def mask_secrets(text):

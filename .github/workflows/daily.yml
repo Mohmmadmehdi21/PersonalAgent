@@ -5,6 +5,10 @@ on:
   workflow_dispatch:
 permissions:
   contents: write
+  actions: read
+concurrency:
+  group: personalagent-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -12,7 +16,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+        with: { python-version: "3.13.7" }
+      - name: Restore pipeline queue and media cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            state.json
+            review/queue.json
+            work/
+            data/used_videos.json
+            data/rejected_ids.json
+          key: personalagent-runtime-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            personalagent-runtime-${{ github.ref_name }}-
       - run: sudo apt-get update && sudo apt-get install -y ffmpeg fonts-dejavu-core
       - run: pip install -r requirements.txt
       - name: OAuth files securely write karo
@@ -29,12 +45,23 @@ jobs:
                   raise SystemExit(f"Required GitHub Actions secret {env_name} is missing.")
               Path(file_name).write_text(value, encoding="utf-8")
           PY
-      - run: python main.py
+      - name: Prepare drafts only (publishing disabled)
+        run: python main.py prepare
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          DRY_RUN: "false"
-          REQUIRE_REVIEW: "false"
+          DRY_RUN: "true"
           OWN_CONTENT_ENABLED: "false"
+      - name: Save pipeline queue and media cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            state.json
+            review/queue.json
+            work/
+            data/used_videos.json
+            data/rejected_ids.json
+          key: personalagent-runtime-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
       - name: state.json commit
         run: |
           git config user.name "bot"; git config user.email "bot@users.noreply.github.com"

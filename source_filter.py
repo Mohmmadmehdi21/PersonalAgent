@@ -83,49 +83,33 @@ def get_video_durations(video_ids):
     """
     Fetches duration (in seconds) for a list of video IDs.
     Returns dict: {video_id: duration_in_seconds or None}
-    Uses YouTube Data API if accessible, falling back to yt-dlp metadata.
+    Uses non-interactive yt-dlp metadata only; this helper must never start OAuth.
     Fail-open: returns None for IDs whose duration could not be determined.
     """
     durations = {vid: None for vid in video_ids if vid}
     if not durations:
         return durations
 
-    # 1. Attempt YouTube Data API (fastest, batched)
     try:
-        from upload import get_service
-        yt = get_service()
-        if yt:
-            valid_ids = list(durations.keys())
-            for i in range(0, len(valid_ids), 50):
-                chunk = valid_ids[i:i + 50]
-                res = yt.videos().list(part="contentDetails", id=",".join(chunk)).execute()
-                for item in res.get("items", []):
-                    item_id = item.get("id")
-                    dur_str = item.get("contentDetails", {}).get("duration")
-                    dur_sec = parse_iso8601_duration(dur_str)
-                    if item_id in durations and dur_sec is not None:
-                        durations[item_id] = dur_sec
+        import yt_dlp
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": True,
+            "socket_timeout": 15,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            for vid in durations:
+                try:
+                    v_url = f"https://www.youtube.com/watch?v={vid}"
+                    info = ydl.extract_info(v_url, download=False)
+                    dur = (info or {}).get("duration")
+                    if dur is not None:
+                        durations[vid] = float(dur)
+                except Exception:
+                    pass
     except Exception:
         pass
-
-    # 2. Fallback to yt-dlp flat metadata for remaining unknown IDs
-    unknown_ids = [vid for vid, dur in durations.items() if dur is None]
-    if unknown_ids:
-        try:
-            import yt_dlp
-            ydl_opts = {"quiet": True, "no_warnings": True, "extract_flat": True}
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                for vid in unknown_ids:
-                    try:
-                        v_url = f"https://www.youtube.com/watch?v={vid}"
-                        info = ydl.extract_info(v_url, download=False)
-                        dur = (info or {}).get("duration")
-                        if dur is not None:
-                            durations[vid] = float(dur)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
 
     return durations
 

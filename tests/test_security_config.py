@@ -23,7 +23,7 @@ def load_config(environ):
 
 
 def validate(config, environ, command):
-    with patch.dict(os.environ, environ, clear=True):
+    with patch.dict(os.environ, environ, clear=True), patch.object(config, "load_project_env", return_value=None):
         return config.validate_startup_config(command)
 
 
@@ -43,6 +43,10 @@ class SecretRedactionTests(unittest.TestCase):
         self.assertNotIn("fake.access.token", result)
         self.assertNotIn("syntheticrefreshvaluenotreal12345", result)
         self.assertNotIn("/tmp/profile/token_growth.json", result)
+
+    def test_telegram_commands_and_task_instructions_are_not_masked(self):
+        message = "Use /task 7b10e3d79776 for status. Commands: /start /help /status /health."
+        self.assertEqual(logger.mask_secrets(message), message)
 
     def test_user_home_path_is_redacted(self):
         home = str(Path.home())
@@ -75,9 +79,10 @@ class SecretRedactionTests(unittest.TestCase):
 
         with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": token, "TELEGRAM_CHAT_ID": "12345"}):
             with patch.object(notify.urllib.request, "urlopen", side_effect=fake_urlopen):
-                self.assertTrue(notify.send_telegram(f"A user pasted {token} into a message."))
+                self.assertTrue(notify.send_telegram(f"Use /task task-123 for status. A user pasted {token} into a message."))
         self.assertNotIn(token, captured[0]["text"])
         self.assertIn("********", captured[0]["text"])
+        self.assertIn("/task task-123", captured[0]["text"])
 
 
 class StartupConfigTests(unittest.TestCase):
@@ -102,6 +107,31 @@ class StartupConfigTests(unittest.TestCase):
                     validate(config, {"NOTIFY_CHANNEL": "none", "DRY_RUN": "false"}, "render")
                 self.assertIn("token.json", str(raised.exception))
                 self.assertNotIn("secret-value", str(raised.exception))
+            finally:
+                os.chdir(previous)
+
+    def test_prepare_with_direct_video_sources_does_not_require_oauth(self):
+        config = load_config({"NOTIFY_CHANNEL": "none", "DRY_RUN": "true"})
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as tmp:
+            Path(tmp, "sources.txt").write_text("https://www.youtube.com/watch?v=abcdefghijk\n", encoding="utf-8")
+            previous = os.getcwd()
+            os.chdir(tmp)
+            try:
+                warnings = validate(config, {"NOTIFY_CHANNEL": "none", "DRY_RUN": "true"}, "prepare")
+                self.assertFalse(any("OAuth" in warning for warning in warnings))
+            finally:
+                os.chdir(previous)
+
+    def test_prepare_with_channel_sources_requires_oauth(self):
+        config = load_config({"NOTIFY_CHANNEL": "none", "DRY_RUN": "true"})
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as tmp:
+            Path(tmp, "sources.txt").write_text("https://www.youtube.com/@sample\n", encoding="utf-8")
+            previous = os.getcwd()
+            os.chdir(tmp)
+            try:
+                with self.assertRaises(config.ConfigurationError) as raised:
+                    validate(config, {"NOTIFY_CHANNEL": "none", "DRY_RUN": "true"}, "prepare")
+                self.assertIn("YouTube OAuth is required", str(raised.exception))
             finally:
                 os.chdir(previous)
 

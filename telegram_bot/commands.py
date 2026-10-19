@@ -1,6 +1,7 @@
 """Allowlisted command routing and safe, low-disclosure status handlers."""
 import json
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -11,11 +12,11 @@ DATA_DIR = Path("data")
 QUEUE_FILE = Path(os.getenv("REVIEW_DIR", "review")) / "queue.json"
 COMMAND_NAMES = ("start", "help", "commands", "status", "health", "queue", "logs", "task", "history",
                  "showanalytics", "showviews", "showlikes", "showcomments", "videos",
-                 "prepare", "upload", "pause", "resume", "cancel", "retry", "confirm", "deny")
+                 "review", "prepare", "upload", "pause", "resume", "cancel", "retry", "confirm", "deny")
 
 
 def _commands(_message):
-    return ("Available commands: /start, /help, /commands, /status, /health, /queue, /logs, "
+    return ("Available commands: /start, /help, /commands, /status, /health, /queue, /review, /logs, "
             "/task TASK_ID, /history, /showanalytics 7d|28d, /showviews VIDEO_ID, "
             "/showlikes VIDEO_ID, /showcomments VIDEO_ID, /videos. You can also ask in plain language, "
             "for example: 'last 7 days analytics', 'count upload-ready clips', 'explain latest error', "
@@ -23,7 +24,104 @@ def _commands(_message):
 
 
 def _start(_message):
-    return "PersonalAgent control bot is ready. Use /help to see available commands."
+    return ("PersonalAgent monitoring menu. Choose an option to view the current task, queue, health, "
+            "or clips that need review. These controls are for monitoring and read-only review.")
+
+
+def _menu_keyboard():
+    return {"inline_keyboard": [
+        [{"text": "Task Status", "callback_data": "pa1:status"}, {"text": "Queue", "callback_data": "pa1:queue:0"}],
+        [{"text": "Health", "callback_data": "pa1:health"}, {"text": "Review Clips", "callback_data": "pa1:review:0"}],
+        [{"text": "Prepare Clips", "callback_data": "pa2:prepare"}],
+        [{"text": "Help", "callback_data": "pa1:help"}],
+    ]}
+
+
+def _page_keyboard(kind, page, total):
+    row = []
+    if page > 0:
+        row.append({"text": "← Previous", "callback_data": f"pa1:{kind}:{page - 1}"})
+    if (page + 1) * 5 < total:
+        row.append({"text": "Next →", "callback_data": f"pa1:{kind}:{page + 1}"})
+    rows = [row] if row else []
+    rows.append([{"text": "Main Menu", "callback_data": "pa1:home"}])
+    return {"inline_keyboard": rows}
+
+
+def _callback_action(data):
+    """Parse only the small, explicit Phase 1 callback allowlist."""
+    if not isinstance(data, str) or len(data) > 64:
+        return None
+    if data in {"pa1:status", "pa1:health", "pa1:help", "pa1:home", "pa2:prepare"}:
+        return data.split(":", 1)[1], 0
+    match = re.fullmatch(r"pa1:(queue|review):(0|[1-9][0-9]{0,3})", data)
+    return (match.group(1), int(match.group(2))) if match else None
+
+
+def _callback_response(action, page, *, queue_reader=None, heartbeat_reader=None, max_hours=None,
+                       now=None, monitor_reader=None, integrations_reader=None, message=None):
+    if action == "home":
+        return _start(None), _menu_keyboard()
+    if action == "status":
+        return _status(None, queue_reader, monitor_reader), _home_keyboard()
+    if action == "health":
+        return _health(heartbeat_reader, max_hours, now, monitor_reader,
+                       integrations_reader, storage_checker=_safe_storage_snapshot), _home_keyboard()
+    if action == "help":
+        return _menu_help(), _home_keyboard()
+    if action == "prepare":
+        from telegram_bot.control import DuplicateTaskRequest
+        try:
+            request_key = f"menu-prepare:{message.get('from', {}).get('id')}:{message.get('message_id')}"
+            return _control_launch("prepare", message, request_key=request_key), _home_keyboard()
+        except DuplicateTaskRequest as duplicate:
+            return (f"This Prepare button was already used. Task {duplicate.task_id} is saved as "
+                    f"{duplicate.status}; use a new /start menu to request another run."), _home_keyboard()
+        except RuntimeError as exc:
+            if "already active" in str(exc):
+                return "A controlled task is already active. Check Task Status before starting another run.", _home_keyboard()
+            raise
+    if action == "queue":
+        items = (queue_reader or _read_queue)()
+        text, count = _render_queue_page(items, page)
+        if page and page * 5 >= count:
+            return "This queue page is no longer available. Return to Main Menu and reopen Queue.", _home_keyboard()
+        return text, _page_keyboard("queue", page, count)
+    if action == "review":
+        items = (queue_reader or _read_queue)()
+        review_items = [item for item in items if _eligible_for_review(item)]
+        text, count = _render_review_page(review_items, page)
+        if page and page * 5 >= count:
+            return "This review page is no longer available. Return to Main Menu and reopen Review Clips.", _home_keyboard()
+        return text, _page_keyboard("review", page, count)
+    return "This menu action is unavailable. Send /start for a fresh menu.", None
+
+
+def _home_keyboard():
+    return {"inline_keyboard": [[{"text": "Main Menu", "callback_data": "pa1:home"}]]}
+
+
+def _menu_help():
+    return ("Monitoring menu: Task Status shows saved task state and verified process activity; Queue shows "
+            "read-only queue counts and entries; Health shows configuration, recorded checks, and local storage; "
+            "Review Clips lists items currently marked needs_review. Prepare Clips starts the existing background "
+            "preparation pipeline and does not publish. Use Main Menu to return. Supported monitoring "
+            "commands: /start, /help, /status, /queue, /health, /review. Other existing bot commands remain "
+            "available through /help. Upload remains outside this menu action.")
+
+
+def _safe_storage_snapshot():
+    """Read-only storage check; avoid the existing write-probe helper for menu views."""
+    from notify import get_disk_free_gb
+    data_path = DATA_DIR
+    queue_path = QUEUE_FILE
+    return {
+        "data_writable": None,
+        "review_writable": None,
+        "data_write_permission": os.access(data_path, os.W_OK) if data_path.exists() else os.access(data_path.parent, os.W_OK),
+        "review_write_permission": os.access(queue_path.parent, os.W_OK) if queue_path.parent.exists() else os.access(queue_path.parent.parent, os.W_OK),
+        "free_gb": get_disk_free_gb("."),
+    }
 
 
 def _help(_message):
@@ -32,6 +130,7 @@ def _help(_message):
             "\n/task TASK_ID — task state\n/history — recent task results"
             "\n/showanalytics 7d|28d — channel Analytics report\n/showviews VIDEO_ID /showlikes VIDEO_ID /showcomments VIDEO_ID"
             "\n/videos — latest channel uploads and current views"
+            "\n/review — inspect clips that need manual review"
             "\n/prepare, /upload — start background work; /upload asks before public upload"
             "\n/pause, /resume — pause or continue at safe checkpoints"
             "\n/cancel TASK_ID, /retry TASK_ID — cancel safely or retry eligible failed work"
@@ -43,19 +142,81 @@ def _help(_message):
 def _status(_message, queue_reader=None, monitor_reader=None):
     queue = (queue_reader or _read_queue)()
     counts = _queue_counts(queue)
-    try:
-        from telegram_bot.control import _read as read_control
-        control_data = read_control()
-        active = [task for task in control_data.get("tasks", {}).values()
-                  if task.get("status") in {"queued", "running", "waiting_confirmation", "paused", "cancelling"}]
-        if active:
-            task = active[0]
-            return (f"Telegram task {task.get('id')} ({task.get('kind')}): {task.get('status')}.\nQueue: "
-                    + ", ".join(f"{state}={count}" for state, count in counts.items()))
-        if control_data.get("paused"):
-            return "Pipeline paused at safe checkpoints.\nQueue: " + ", ".join(f"{state}={count}" for state, count in counts.items())
-    except Exception:
-        pass
+    from telegram_bot.control import CONTROL_FILE, _read as read_control
+    control_data = read_control()
+    if not isinstance(control_data, dict) or not isinstance(control_data.get("tasks", {}), dict):
+        raise ValueError("Telegram task-state storage is invalid; task status is unavailable.")
+    if CONTROL_FILE.exists():
+        try:
+            persisted = json.loads(CONTROL_FILE.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ValueError("Telegram task-state storage could not be read; task status is unavailable.") from exc
+        if not isinstance(persisted, dict) or not isinstance(persisted.get("tasks", {}), dict):
+            raise ValueError("Telegram task-state storage is invalid; task status is unavailable.")
+        if any(not isinstance(task, dict) for task in persisted.get("tasks", {}).values()):
+            raise ValueError("Telegram task-state storage contains malformed records; task status is unavailable.")
+    active_statuses = {"queued", "running", "waiting_confirmation", "paused", "cancelling"}
+    active = [task for task in control_data.get("tasks", {}).values()
+              if isinstance(task, dict) and task.get("status") in active_statuses]
+    task_states = []
+    for task in active:
+        pid = task.get("pid")
+        if task.get("status") == "queued" and not pid:
+            live_state = "queued; process not started"
+        elif not pid:
+            live_state = "live status unknown (no process ID recorded)"
+        else:
+            try:
+                alive = monitoring.pid_is_alive(pid)
+                live_state = "process active" if alive else "is not running; saved status remains " + str(task.get("status", "unknown"))
+            except Exception:
+                alive = None
+                live_state = "live status unknown"
+        registry_data = (monitor_reader or monitoring.read_registry)()
+        stage = registry_data.get("stage") if registry_data.get("pid") == pid else None
+        task_states.append((task, live_state, stage))
+    if task_states:
+        task, live_state, stage = task_states[0]
+        status = task.get("status", "unknown")
+        lines = [f"Telegram task {task.get('id', 'unknown')} ({task.get('kind', 'task')}): {status}; {live_state}."]
+        if stage:
+            stage_label = "Current recorded processing stage" if live_state == "process active" else "Last recorded processing stage"
+            lines.append(f"{stage_label}: {monitoring.mask_secrets(str(stage)[:100])}.")
+        else:
+            lines.append("Processing stage: not recorded for this task.")
+        lines.append(f"Started: {task.get('created_at', 'not recorded')}; last update: {task.get('updated_at', 'not recorded')}.")
+        if task.get("error"):
+            lines.append("Saved failure: " + monitoring.mask_secrets(str(task["error"])[:180]))
+            lines.append("Next step: inspect the saved error and resume only through the existing owner-controlled workflow.")
+        elif status == "waiting_confirmation":
+            lines.append("The task is waiting for owner confirmation.")
+        lines.append("Last completed pipeline result: " + str(registry_data.get("last_run_status", "not recorded")) +
+                     "; this is separate from YouTube publication.")
+        lines.append("Queue: " + ", ".join(f"{state}={count}" for state, count in counts.items()))
+        return "\n".join(lines)
+    terminal_tasks = [task for task in control_data.get("tasks", {}).values()
+                      if isinstance(task, dict) and task.get("status") in {"completed", "failed", "cancelled"}]
+    if terminal_tasks:
+        task = terminal_tasks[-1]
+        registry_data = (monitor_reader or monitoring.read_registry)()
+        status = str(task.get("status", "unknown"))
+        lines = [f"No Telegram task is active. Last task {task.get('id', 'unknown')} ({task.get('kind', 'task')}): {status}.",
+                 f"Started: {task.get('created_at', 'not recorded')}; last update: {task.get('updated_at', 'not recorded')}.",
+                 "Last pipeline result: " + str(registry_data.get("last_run_status", status)) +
+                 "; task completion does not by itself confirm YouTube publication."]
+        if task.get("error"):
+            lines.append("Failure: " + monitoring.mask_secrets(str(task["error"])[:180]))
+            lines.append("Next step: inspect the saved failure detail and use the existing owner-controlled recovery path.")
+        if not registry_data.get("last_publication_at"):
+            lines.append("Last upload marker: not recorded.")
+        elif registry_data.get("last_publication_visibility") == "public":
+            lines.append("Last public publication was confirmed by the YouTube API.")
+        else:
+            lines.append("Last upload success marker is recorded; public visibility is unverified (legacy state).")
+        lines.append("Queue: " + ", ".join(f"{state}={count}" for state, count in counts.items()))
+        return "\n".join(lines)
+    if control_data.get("paused"):
+        return "Pipeline paused at safe checkpoints.\nQueue: " + ", ".join(f"{state}={count}" for state, count in counts.items())
     data = (monitor_reader or monitoring.read_registry)()
     if data.get("running"):
         task = data.get("current_task") or "unknown"
@@ -70,13 +231,15 @@ def _status(_message, queue_reader=None, monitor_reader=None):
     else:
         status = data.get("last_run_status", "no run recorded")
         activity = f"Not running; last run status={status}."
-    return activity + "\nQueue: " + ", ".join(f"{state}={count}" for state, count in counts.items())
+    result = data.get("last_run_status", "not recorded")
+    return (activity + f"\nLast completed pipeline result: {result}; this is separate from YouTube publication."
+            + "\nQueue: " + ", ".join(f"{state}={count}" for state, count in counts.items()))
 
 
 def _queue_counts(queue):
     counts = {state: 0 for state in ("pending", "processing", "uploaded", "failed", "blocked", "needs_review")}
     for item in queue:
-        state = item.get("status", "pending")
+        state = item.get("status") or "pending"
         if state in counts:
             counts[state] += 1
     return counts
@@ -84,34 +247,136 @@ def _queue_counts(queue):
 
 def _queue(_message, queue_reader=None):
     items = (queue_reader or _read_queue)()
+    return _render_queue_page(items, 0)[0]
+
+
+def _render_queue_page(items, page):
     counts = _queue_counts(items)
-    lines = ["Queue: " + ", ".join(f"{state}={counts[state]}" for state in ("pending", "needs_review", "failed", "blocked", "uploaded"))]
-    for state in ("pending", "needs_review", "failed", "blocked", "uploaded"):
-        matches = [item for item in items if item.get("status", "pending") == state]
-        for item in matches[:3]:
-            label = str(item.get("id") or item.get("key") or "unknown")[:70]
-            label = monitoring.mask_secrets(label)
-            title = monitoring.mask_secrets(str(item.get("title") or "")[:70])
-            lines.append(f"{state}: {label}" + (f" — {title}" if title else ""))
-            reason = item.get("review_reason") or item.get("quality_reason")
-            if state == "needs_review" and reason:
-                lines.append("  Review reason: " + monitoring.mask_secrets(str(reason)[:180]))
-        if len(matches) > 3:
-            lines.append(f"{state}: +{len(matches) - 3} more")
-    return "\n".join(lines)
+    order = ("pending", "processing", "needs_review", "failed", "blocked", "uploaded")
+    entries = [item for state in order for item in items if (item.get("status") or "pending") == state]
+    unknown = [item for item in items if (item.get("status") or "pending") not in order]
+    entries.extend(unknown)
+    start = page * 5
+    lines = ["Queue: " + ", ".join(f"{state}={counts[state]}" for state in order),
+             f"Items {min(start + 1, len(entries)) if entries else 0}-{min(start + 5, len(entries))} of {len(entries)}."]
+    if unknown:
+        lines.append(f"Unmapped status records: {len(unknown)} (stored status retained; no category inferred).")
+    for item in entries[start:start + 5]:
+        state = item.get("status") or "pending"
+        if state not in order:
+            state = f"unmapped({monitoring.mask_secrets(str(state)[:40])})"
+        label = monitoring.mask_secrets(str(item.get("id") or item.get("key") or "unknown")[:70])
+        title = monitoring.mask_secrets(str(item.get("title") or item.get("filename") or "")[:70])
+        lines.append(f"{state}: {label}" + (f" — {title}" if title else ""))
+        reason = item.get("review_reason") or item.get("quality_reason") or item.get("last_error")
+        if state in ("needs_review", "failed", "blocked") and reason:
+            lines.append("  Reason: " + monitoring.mask_secrets(str(reason)[:180]))
+    return "\n".join(lines), len(entries)
+
+
+def _eligible_for_review(item):
+    return (isinstance(item, dict) and
+            (item.get("status") == "needs_review" or
+             (item.get("quality_status") == "needs_review" and not item.get("quality_reviewed"))))
+
+
+def _render_review_page(review_items, page):
+    start = page * 5
+    lines = [f"Manual review required: {len(review_items)} clip(s).",
+             f"Items {min(start + 1, len(review_items)) if review_items else 0}-{min(start + 5, len(review_items))} of {len(review_items)}."]
+    for item in review_items[start:start + 5]:
+        label = monitoring.mask_secrets(str(item.get("id") or item.get("key") or "unknown")[:70])
+        title = monitoring.mask_secrets(str(item.get("title") or item.get("filename") or "")[:70])
+        reason = item.get("review_reason") or item.get("quality_reason") or item.get("upload_error") or item.get("last_error")
+        lines.append(f"{label}" + (f" — {title}" if title else ""))
+        if reason:
+            lines.append("  Reason: " + monitoring.mask_secrets(str(reason)[:180]))
+    return "\n".join(lines), len(review_items)
+
+
+def _review(_message, queue_reader=None):
+    items = (queue_reader or _read_queue)()
+    review_items = [item for item in items if _eligible_for_review(item)]
+    if not review_items:
+        return "No clips currently need manual review."
+    return _render_review_page(review_items, 0)[0]
 
 
 def _read_queue():
-    from queue_manager import load_queue
-    return load_queue(QUEUE_FILE)
+    """Read queue JSON without queue_manager migration or any write side effects."""
+    try:
+        value = json.loads(QUEUE_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("Queue data is not a JSON list; monitoring was not able to inspect it safely.")
+    if any(not isinstance(item, dict) for item in value):
+        raise ValueError("Queue contains a malformed record; monitoring was not able to inspect it safely.")
+    return value
 
 
-def _health(heartbeat_reader=None, max_hours=None, now=None, monitor_reader=None, integrations_reader=None):
+def _check_storage():
+    from notify import get_disk_free_gb
+    res = {"data_writable": False, "review_writable": False, "free_gb": get_disk_free_gb(".")}
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        test_file = DATA_DIR / ".write_test.tmp"
+        test_file.write_text("ok", encoding="utf-8")
+        test_file.unlink()
+        res["data_writable"] = True
+    except Exception:
+        pass
+    try:
+        QUEUE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        test_file = QUEUE_FILE.parent / ".write_test.tmp"
+        test_file.write_text("ok", encoding="utf-8")
+        test_file.unlink()
+        res["review_writable"] = True
+    except Exception:
+        pass
+    return res
+
+
+def _health(heartbeat_reader=None, max_hours=None, now=None, monitor_reader=None, integrations_reader=None, storage_checker=None):
+    from env_config import load_project_env
+    load_project_env()
     data = (heartbeat_reader or _read_heartbeat)()
     last = data.get("last_success") if isinstance(data, dict) else None
-    lines = ["Health (configuration/recorded state; no live API probe):"]
+    lines = ["Health Summary:"]
+    lines.append(f"Configuration: Telegram bot token={'configured' if os.getenv('TELEGRAM_BOT_TOKEN', '').strip() else 'missing'}; "
+                 f"owner IDs={'configured' if os.getenv('TELEGRAM_OWNER_IDS', '').strip() else 'missing'}; "
+                 f"queue path={'configured' if str(QUEUE_FILE).strip() else 'missing'}.")
+    check_storage = storage_checker or _check_storage
+    storage = check_storage()
+    def storage_result(name):
+        if storage.get(name + "_writable") is not None:
+            return "writable" if storage.get(name + "_writable") else "unwritable"
+        permission = storage.get(name + "_write_permission")
+        return "write not tested" + (" (permission appears available)" if permission else " (permission unavailable/unknown)")
+    lines.append(f"Storage: data={storage_result('data')}, review={storage_result('review')}, free_space={storage.get('free_gb', 0):.1f}GB")
     integrations = (integrations_reader or monitoring.integration_status)()
     lines.extend(f"{name}: {value}" for name, value in integrations.items())
+    try:
+        from telegram_bot.control import _read as read_control
+        control_state = read_control()
+        if not isinstance(control_state, dict) or not isinstance(control_state.get("tasks", {}), dict):
+            lines.append("Background task state: unavailable (invalid saved state).")
+        else:
+            lines.append(f"Background task state: available; {len(control_state.get('tasks', {}))} saved task(s).")
+    except Exception:
+        lines.append("Background task state: unavailable (read failed).")
+    scheduler_path = DATA_DIR / "scheduler.json"
+    if os.getenv("SCHEDULER_ENABLED", "false").strip().lower() in ("true", "1", "t", "yes"):
+        if scheduler_path.is_file():
+            try:
+                scheduler_state = json.loads(scheduler_path.read_text(encoding="utf-8"))
+                lines.append(f"Scheduler: configured enabled; saved state={'available' if isinstance(scheduler_state, dict) else 'invalid'}; not started or changed by this check.")
+            except (OSError, ValueError):
+                lines.append("Scheduler: configured enabled; saved state could not be read; not started or changed by this check.")
+        else:
+            lines.append("Scheduler: configured enabled; no saved state recorded; not started or changed by this check.")
+    else:
+        lines.append(f"Scheduler: disabled by configuration; saved state {'present' if scheduler_path.is_file() else 'not recorded'}; configuration was not changed.")
     if last:
         try:
             parsed = datetime.fromisoformat(str(last).replace("Z", "+00:00"))
@@ -126,6 +391,19 @@ def _health(heartbeat_reader=None, max_hours=None, now=None, monitor_reader=None
         lines.append("Last success marker: not recorded.")
     registry = (monitor_reader or monitoring.read_registry)()
     lines.append(f"Last run result: {registry.get('last_run_status', 'not recorded')}")
+    if registry.get("last_failed_stage"):
+        lines.append(f"Last failed stage: {monitoring.mask_secrets(str(registry['last_failed_stage'])[:120])}")
+    publications = registry.get("last_run_publications")
+    if publications is None:
+        lines.append("Last run publication: not recorded (no publication marker available).")
+    elif int(publications or 0) == 0:
+        lines.append("Last run publication: none confirmed; preparation/task completion is not publication.")
+    elif registry.get("last_run_publication_visibility") == "public":
+        lines.append(f"Last run publication: {int(publications)} public YouTube upload(s) confirmed by API.")
+    else:
+        lines.append(f"Last run: {int(publications)} YouTube upload(s) recorded; public visibility is unverified (legacy state).")
+    if not registry.get("last_publication_at"):
+        lines.append("Last public publication marker: not recorded.")
     api = registry.get("last_api_response")
     lines.append("Last API result: " + (f"{api.get('task')}={api.get('status')} ({api.get('category') or 'no error'})" if api else "not recorded"))
     error = registry.get("last_error")
@@ -140,9 +418,19 @@ def _read_heartbeat():
         return {}
 
 
-def _parse_command(update):
-    message = update.get("message") or update.get("edited_message") or {}
-    text = message.get("text", "")
+def _parse_command(update, message=None):
+    if message is None:
+        message = update.get("message") or update.get("edited_message") or {}
+        if not message and update.get("callback_query"):
+            cb = update.get("callback_query") or {}
+            cb_msg = cb.get("message") or {}
+            if isinstance(cb_msg, dict):
+                message = dict(cb_msg)
+                if cb.get("data"):
+                    message["text"] = cb.get("data")
+                if cb.get("from"):
+                    message["from"] = cb.get("from")
+    text = message.get("text", "") if isinstance(message, dict) else ""
     parts = text.strip().split()
     if not parts or not parts[0].startswith("/"):
         return None, []
@@ -158,8 +446,14 @@ def _task(args, queue_reader=None, monitor_reader=None):
         from telegram_bot.control import task_info
         controlled = task_info(task_id)
         if controlled:
-            return (f"Task {task_id}: {controlled.get('status', 'unknown')} ({controlled.get('kind')})"
-                    + (f"; error={monitoring.mask_secrets(str(controlled.get('error'))[:200])}" if controlled.get("error") else ""))
+            parts = [f"Task {task_id}: {controlled.get('status', 'unknown')} ({controlled.get('kind')})"]
+            if controlled.get("pid"):
+                parts.append(f"PID: {controlled['pid']}")
+            if controlled.get("clip_ids"):
+                parts.append(f"Clips: {', '.join(str(c) for c in controlled['clip_ids'][:5])}")
+            if controlled.get("error"):
+                parts.append(f"error={monitoring.mask_secrets(str(controlled.get('error'))[:200])}")
+            return "; ".join(parts)
     except Exception:
         pass
     queue = (queue_reader or _read_queue)()
@@ -174,14 +468,28 @@ def _task(args, queue_reader=None, monitor_reader=None):
 
 
 def _history(monitor_reader=None):
+    lines = []
+    try:
+        from telegram_bot.control import _read as read_control
+        tasks = list(read_control().get("tasks", {}).values())
+        if tasks:
+            for task in tasks[-5:]:
+                tid = task.get("id", "unknown")
+                kind = task.get("kind", "task")
+                st = task.get("status", "unknown")
+                lines.append(f"Telegram {kind} ({tid}): {st}" + (f" ({monitoring.mask_secrets(str(task.get('error'))[:100])})" if task.get("error") else ""))
+    except Exception:
+        pass
     results = (monitor_reader or monitoring.read_registry)().get("task_results", [])
-    if not results:
+    if results:
+        for row in results[-5:]:
+            lines.append(
+                f"{row.get('at', '')} {monitoring.mask_secrets(row.get('task', 'unknown'))}: {row.get('status', 'unknown')}"
+                + (f" ({row.get('error_category')})" if row.get("error_category") else "")
+            )
+    if not lines:
         return "No task results recorded yet."
-    return "Recent task results:\n" + "\n".join(
-        f"{row.get('at', '')} {monitoring.mask_secrets(row.get('task', 'unknown'))}: {row.get('status', 'unknown')}"
-        + (f" ({row.get('error_category')})" if row.get("error_category") else "")
-        for row in results[-5:]
-    )
+    return "Recent task results:\n" + "\n".join(lines)
 
 
 def _report_clients(client_factory=None, *, need_analytics=False):
@@ -228,8 +536,48 @@ def handle_update(update, owner_ids, *, queue_reader=None, heartbeat_reader=None
     """Return (chat_id, response) or None. Authorization precedes all protected reads."""
     if not is_authorized(update, owner_ids):
         return None
+    callback = update.get("callback_query") if isinstance(update, dict) else None
+    if isinstance(callback, dict):
+        cb_message = callback.get("message") or {}
+        chat_id = str((cb_message.get("chat") or {}).get("id", ""))
+        legacy_approval = re.fullmatch(r"/(confirm|deny) ([A-Za-z0-9_-]{1,100})", callback.get("data", ""))
+        if legacy_approval and isinstance(cb_message, dict):
+            # Preserve the existing upload approval buttons through the original command path.
+            approval_message = dict(cb_message)
+            approval_message["from"] = callback.get("from") or {}
+            approval_message["text"] = callback["data"]
+            return handle_update({"message": approval_message}, owner_ids, queue_reader=queue_reader,
+                                 heartbeat_reader=heartbeat_reader, max_hours=max_hours, now=now,
+                                 monitor_reader=monitor_reader, logs_reader=logs_reader,
+                                 integrations_reader=integrations_reader, report_client_factory=report_client_factory,
+                                 intent_classifier=intent_classifier, audit_writer=audit_writer)
+        parsed = _callback_action(callback.get("data"))
+        if parsed is None:
+            return chat_id, "This menu action is invalid or expired. Send /start for a fresh menu."
+        action, page = parsed
+        try:
+            text, markup = _callback_response(
+                action, page, queue_reader=queue_reader, heartbeat_reader=heartbeat_reader,
+                max_hours=max_hours, now=now, monitor_reader=monitor_reader,
+                integrations_reader=integrations_reader,
+                message={**cb_message, "from": callback.get("from") or {}},
+            )
+        except Exception as exc:
+            try:
+                from logger import log_error, mask_secrets
+                log_error(f"[Telegram] Menu callback '{action}' failed: {mask_secrets(exc)}")
+            except Exception:
+                pass
+            failure_messages = {
+                "status": "Task status is unavailable because its saved state could not be read. Check the local run log.",
+                "queue": "Queue information is unavailable because the saved queue could not be read. Check the local run log.",
+                "review": "Review list is unavailable because the saved queue could not be read. Check the local run log.",
+                "health": "Health information is incomplete because a local diagnostic could not be read. Check the local run log.",
+            }
+            text, markup = failure_messages.get(action, "Unable to read this monitoring information. Check the local run log."), _home_keyboard()
+        return (chat_id, text, markup) if markup else (chat_id, text)
     message = update.get("message") or update.get("edited_message") or {}
-    command, args = _parse_command(update)
+    command, args = _parse_command(update, message)
     if command is None:
         raw = (message.get("text") or "").strip()
         if raw.startswith("/"):
@@ -239,7 +587,7 @@ def handle_update(update, owner_ids, *, queue_reader=None, heartbeat_reader=None
             report_client_factory=report_client_factory,
             intent_classifier=intent_classifier, audit_writer=audit_writer,
         )
-    if command in {"start", "help", "commands", "status", "health", "queue", "logs", "history", "videos"} and args:
+    if command in {"start", "help", "commands", "status", "health", "queue", "review", "logs", "history", "videos"} and args:
         return str(message["chat"]["id"]), "This command takes no arguments. Use /help."
     if command in {"showanalytics", "showviews", "showlikes", "showcomments"} and not args:
         return str(message["chat"]["id"]), f"Usage: /{command} {'7d or 28d' if command == 'showanalytics' else 'VIDEO_ID'}"
@@ -255,6 +603,7 @@ def handle_update(update, owner_ids, *, queue_reader=None, heartbeat_reader=None
         "status": lambda msg: _status(msg, queue_reader, monitor_reader),
         "health": lambda msg: _health(heartbeat_reader, max_hours, now, monitor_reader, integrations_reader),
         "queue": lambda msg: _queue(msg, queue_reader),
+        "review": lambda msg: _review(msg, queue_reader),
         "logs": lambda msg: "Recent safe logs:\n" + "\n".join((logs_reader or monitoring.recent_logs)(8)),
         "task": lambda msg: _task(args, queue_reader, monitor_reader),
         "history": lambda msg: _history(monitor_reader),
@@ -282,15 +631,35 @@ def handle_update(update, owner_ids, *, queue_reader=None, heartbeat_reader=None
             pass
         try:
             from telegram_bot.youtube_reports import ReportingError
-            response = str(exc) if isinstance(exc, ReportingError) else "Command failed. Check the local run log for details."
+            if isinstance(exc, ReportingError):
+                response = str(exc)
+            elif command == "status":
+                response = "Task status is unavailable because its saved state could not be read. Check the local run log."
+            elif command in {"queue", "review"}:
+                response = "Queue information is unavailable because the saved queue could not be read. Check the local run log."
+            elif command == "health":
+                response = "Health information is incomplete because a local diagnostic could not be read. Check the local run log."
+            else:
+                response = "Command failed. Check the local run log for details."
         except Exception:
             response = "Command failed. Check the local run log for details."
+    if command == "start":
+        return str(message["chat"]["id"]), response, _menu_keyboard()
     return str(message["chat"]["id"]), response
 
 
-def _control_launch(kind, message):
+def _control_launch(kind, message, request_key=None):
+    if kind == "prepare":
+        from config import ConfigurationError, validate_startup_config
+        try:
+            validate_startup_config("prepare")
+        except ConfigurationError as exc:
+            return "Preparation cannot start because configuration is incomplete: " + monitoring.mask_secrets(str(exc))[:500]
     from telegram_bot.control import launch
-    task_id = launch(kind, message["from"]["id"], message["chat"]["id"])
+    if request_key:
+        task_id = launch(kind, message["from"]["id"], message["chat"]["id"], request_key=request_key)
+    else:
+        task_id = launch(kind, message["from"]["id"], message["chat"]["id"])
     return f"Started background {kind} task {task_id}. Use /task {task_id} for status."
 
 

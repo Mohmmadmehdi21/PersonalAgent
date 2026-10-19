@@ -71,6 +71,7 @@ class Scheduler:
         except ZoneInfoNotFoundError:
             raise ValueError("SCHEDULER_TIMEZONE must be a valid IANA timezone (for example Asia/Kolkata).") from None
         self.prepare_time = _clock("SCHEDULER_PREPARE_TIME", "09:00")
+        self.prepare_enabled = _enabled("SCHEDULER_PREPARE_ENABLED", "true")
         self.source_refresh_enabled = _enabled("SCHEDULER_SOURCE_REFRESH_ENABLED")
         self.source_refresh_time = _clock("SCHEDULER_SOURCE_REFRESH_TIME", "08:00")
         self.analytics_time = _clock("SCHEDULER_ANALYTICS_TIME", "10:00")
@@ -122,9 +123,9 @@ class Scheduler:
             pass
 
     def _launch_job(self, kind, key, draft_limit):
-        from telegram_bot.access import parse_owner_ids
+        from telegram_bot.access import get_owner_ids
         from telegram_bot.control import launch
-        owners = parse_owner_ids(os.getenv("TELEGRAM_OWNER_IDS", ""))
+        owners = get_owner_ids()
         chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
         if not chat_id:
             raise RuntimeError("TELEGRAM_CHAT_ID is required for scheduled tasks and reports.")
@@ -259,12 +260,14 @@ class Scheduler:
                            error="Interrupted during source refresh; it is safe to retry.")
             if row.get("status") == "failed" and row.get("retryable"):
                 scheduled = row.get("scheduled_key", "")
+                scheduled_date = scheduled.split(":", 1)[-1]
                 # Only retry when this scheduled day is still current, avoiding stale catch-up storms.
-                if scheduled == now_ts.astimezone(ZoneInfo(self.timezone)).strftime("%Y-%m-%d"):
+                today_str = datetime.fromtimestamp(now_ts, ZoneInfo(self.timezone)).strftime("%Y-%m-%d")
+                if scheduled_date == today_str:
                     try:
                         kind = row.get("kind")
                         period = os.getenv("SCHEDULER_ANALYTICS_RANGE", "7d").strip()
-                        self._run_due(state, key, kind, period, now_ts.timestamp())
+                        self._run_due(state, key, kind, period, now_ts)
                     except Exception as exc:
                         self._notify_failure(key, exc)
 
@@ -284,7 +287,7 @@ class Scheduler:
             if self.source_refresh_enabled and (local.hour, local.minute) >= self.source_refresh_time:
                 self._run_due(state, f"sources:{date_key}", "source_refresh", None, timestamp)
             prepare_due = (local.hour, local.minute) >= self.prepare_time
-            if prepare_due:
+            if self.prepare_enabled and prepare_due:
                 refresh = state["jobs"].get(f"sources:{date_key}")
                 if not self.source_refresh_enabled or (refresh and refresh.get("status") == "completed"):
                     self._run_due(state, f"prepare:{date_key}", "prepare", None, timestamp)

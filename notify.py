@@ -1,4 +1,4 @@
-import os, sys, json, time, shutil, urllib.request, smtplib, ssl
+import os, sys, json, time, shutil, urllib.request, smtplib, ssl, html
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -9,9 +9,9 @@ if hasattr(sys.stdout, "reconfigure"):
 
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from dotenv import load_dotenv
+from env_config import load_project_env
 
-load_dotenv()
+load_project_env()
 
 from logger import log, log_warn, log_error, mask_secrets
 
@@ -28,14 +28,14 @@ def get_active_channels():
     channels = [c.strip() for c in ch_raw.split(",") if c.strip()]
     return channels
 
-def send_telegram(text):
+def send_telegram(text, parse_mode=None):
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     if not chat_id:
         log_warn("[Notify] Telegram channel selected but TELEGRAM_CHAT_ID is missing.")
         return False
-    return send_telegram_to(chat_id, text)
+    return send_telegram_to(chat_id, text, parse_mode=parse_mode)
 
-def send_telegram_to(chat_id, text):
+def send_telegram_to(chat_id, text, reply_markup=None, parse_mode=None):
     """Send through the existing Telegram integration to an explicit chat."""
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token or not str(chat_id).strip():
@@ -47,9 +47,14 @@ def send_telegram_to(chat_id, text):
     chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
     success = True
 
-    for chunk in chunks:
+    for idx, chunk in enumerate(chunks):
         clean_chunk = mask_secrets(chunk)
-        payload = json.dumps({"chat_id": str(chat_id), "text": clean_chunk}).encode("utf-8")
+        payload_dict = {"chat_id": str(chat_id), "text": clean_chunk}
+        if parse_mode:
+            payload_dict["parse_mode"] = parse_mode
+        if reply_markup is not None and idx == len(chunks) - 1:
+            payload_dict["reply_markup"] = reply_markup
+        payload = json.dumps(payload_dict).encode("utf-8")
         req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
@@ -109,11 +114,47 @@ def broadcast_message(subject, body):
     for ch in channels:
         try:
             if ch == "telegram":
-                send_telegram(f"📢 <b>{subject}</b>\n\n{body}")
+                _send_formatted_telegram(subject, body)
             elif ch == "email":
                 send_email(subject, body)
         except Exception as e:
             log_warn(f"[Notify] Channel '{ch}' dispatch error: {e}")
+
+
+def _send_formatted_telegram(subject, body):
+    """Send notification text as escaped HTML, keeping each message well formed."""
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if not chat_id:
+        log_warn("[Notify] Telegram channel selected but TELEGRAM_CHAT_ID is missing.")
+        return False
+
+    title = html.escape(mask_secrets(subject)[:200], quote=True)
+    body_budget = max(500, 3800 - len(title))
+    safe_body = mask_secrets(body)
+    # Split plain text before escaping so markup and entities cannot be cut.
+    chunks = []
+    current = []
+    current_size = 0
+    for line in safe_body.splitlines() or [""]:
+        fragments = [line[i:i+400] for i in range(0, len(line), 400)] or [""]
+        for fragment in fragments:
+            escaped = html.escape(fragment, quote=True)
+            extra = len(escaped) + (1 if current else 0)
+            if current and current_size + extra > body_budget:
+                chunks.append("\n".join(current))
+                current, current_size = [], 0
+                extra = len(escaped)
+            current.append(escaped)
+            current_size += extra
+    if current or not chunks:
+        chunks.append("\n".join(current))
+
+    ok = True
+    for body_chunk in chunks:
+        text = f"📢 <b>{title}</b>\n\n{body_chunk}"
+        if not send_telegram_to(chat_id, text, parse_mode="HTML"):
+            ok = False
+    return ok
 
 # High-level notification helpers
 def notify_run_success(clips_info, total_seconds, is_dry_run=False, freed_space_str=None):
@@ -121,19 +162,29 @@ def notify_run_success(clips_info, total_seconds, is_dry_run=False, freed_space_
     subject = f"YouTube Agent Run Success {mode_tag}"
 
     lines = [
-        f"✅ <b>PersonalAgent Run uploading are done!</b>",
-        f"Mode: {'DRY RUN (Sirf local clips bane, upload nahi hua)' if is_dry_run else 'LIVE (YouTube par public upload complete)'}",
+        "✅ PersonalAgent run processing complete.",
+        f"Mode: {'DRY RUN (Sirf local clips bane, upload nahi hua)' if is_dry_run else 'LIVE (YouTube API upload results)'}",
         f"Total Duration: {total_seconds:.1f}s",
         f"Clips Count: {len(clips_info)}\n",
-        "<b>Rendered / Uploaded Clips:</b>"
+        "Rendered / Uploaded Clips:"
     ]
 
     for idx, c in enumerate(clips_info):
         title = c.get("title", f"Clip {idx+1}")
         tpl = c.get("template", "INTRO_CARD")
         vid_id = c.get("youtube_video_id")
-        link = f"https://youtu.be/{vid_id}" if vid_id else "(Local Preview Only)"
-        lines.append(f"{idx+1}. {title} [{tpl}] -> {link}")
+        visibility = c.get("youtube_privacy_status")
+        if is_dry_run:
+            result = "(Local Preview Only)"
+        elif vid_id and visibility == "public":
+            result = f"PUBLIC: https://youtu.be/{vid_id}"
+        elif vid_id and visibility == "private":
+            result = f"UPLOADED, PRIVATE (not publicly visible): https://youtu.be/{vid_id}"
+        elif vid_id:
+            result = f"Upload recorded; visibility not verified: https://youtu.be/{vid_id}"
+        else:
+            result = "No verified YouTube video ID"
+        lines.append(f"{idx+1}. {title} [{tpl}] -> {result}")
 
     if freed_space_str:
         lines.append(f"\n🧹 Disk Safai: {freed_space_str} space khali hua.")
@@ -141,25 +192,73 @@ def notify_run_success(clips_info, total_seconds, is_dry_run=False, freed_space_
     body = "\n".join(lines)
     broadcast_message(subject, body)
 
+
+def notify_upload_summary(task_id, clips_info, failures, total_seconds, attempted,
+                          pending, needs_review, stopped_reason=None, failed_count=None):
+    """Report one upload batch from its persisted queue outcomes."""
+    uploaded = len(clips_info)
+    failed_count = len(failures) if failed_count is None else int(failed_count)
+    unresolved = pending + needs_review
+    if stopped_reason:
+        outcome = "paused/stopped"
+    elif failed_count or unresolved:
+        outcome = "completed with unresolved or failed clips"
+    else:
+        outcome = "completed"
+    subject = f"YouTube upload run {task_id}: {outcome}"
+    lines = [
+        f"Task ID: {task_id}",
+        f"Final task outcome: {outcome}",
+        f"Upload requests attempted: {attempted}",
+        f"Confirmed YouTube uploads: {uploaded}",
+        f"Failed or blocked clips: {failed_count}",
+        f"Pending clips: {pending}",
+        f"Needs review: {needs_review}",
+        f"Duration: {total_seconds:.1f}s",
+    ]
+    if stopped_reason:
+        lines.append(f"Batch stop reason: {stopped_reason}")
+    if clips_info:
+        lines.append("Upload outcomes:")
+        for item in clips_info:
+            title = item.get("title", item.get("id", "clip"))
+            video_id = item.get("youtube_video_id")
+            visibility = item.get("youtube_privacy_status")
+            if video_id and visibility == "public":
+                result = f"PUBLIC: https://youtu.be/{video_id}"
+            elif video_id and visibility == "private":
+                result = f"uploaded private; not publicly visible: https://youtu.be/{video_id}"
+            elif video_id:
+                result = f"upload recorded; visibility unverified: https://youtu.be/{video_id}"
+            else:
+                result = "no verified YouTube video ID"
+            lines.append(f"- {title}: {result}")
+    if failures:
+        lines.append("Failed clip details:")
+        for item in failures:
+            lines.append(f"- {item.get('title', 'clip')}: {item.get('error', 'failure')} "
+                         f"({item.get('error_category', 'upload_failure')})")
+    broadcast_message(subject, "\n".join(lines))
+
 def notify_run_error(step_name, error_msg, attempts=1, video_id=None):
     subject = f"⚠️ YouTube Agent Alert: Step '{step_name}' Fail"
     body = (
-        f"❌ <b>PersonalAgent Run Mein Error Aaya!</b>\n\n"
+        f"❌ PersonalAgent Run Mein Error Aaya!\n\n"
         f"Video ID: {video_id or 'N/A'}\n"
         f"Failed Step: {step_name}\n"
         f"Retry Attempts: {attempts}\n"
         f"Error Details: {error_msg}\n\n"
-        f"ℹ️ <b>Resume Note:</b> Script dobara chalane par pending/failed step se resume hoga (completed steps skip rahenge)."
+        f"ℹ️ Resume Note: Script dobara chalane par pending/failed step se resume hoga (completed steps skip rahenge)."
     )
     broadcast_message(subject, body)
 
 def notify_quota_or_auth(error_type, details):
     subject = f"🚨 URGENT: YouTube {error_type}"
     body = (
-        f"🚨 <b>CRITICAL YOUTUBE ACTION REQUIRED</b>\n\n"
+        f"🚨 CRITICAL YOUTUBE ACTION REQUIRED\n\n"
         f"Issue: {error_type}\n"
         f"Details: {details}\n\n"
-        f"ℹ️ <b>Resolution:</b>\n"
+        f"ℹ️ Resolution:\n"
         f"- Quota Exceeded: YouTube daily API limit exhaust ho gayi hai. Yeh Pacific Midnight (approx 12:30 PM / 1:30 PM IST) par auto-reset hoti hai.\n"
         f"- Token Invalid: 'token.json' expire ya revoke ho gaya hai. 'python test_auth.py' chalakar re-login karein."
     )
@@ -170,7 +269,7 @@ def notify_queue_empty(summary=None):
     subject = "ℹ️ YouTube Agent: Queue Khali Hai"
     detail_line = f"\nChecked summary: {summary}\n" if summary else ""
     body = (
-        "ℹ️ <b>Queue Khali Hai</b>\n\n"
+        "ℹ️ Queue Khali Hai\n\n"
         f"sources.txt mein koi naya unprocessed video URL nahi mila.{detail_line}\n"
         "Kripya sources.txt mein naye video URLs ya channel link add karein."
     )

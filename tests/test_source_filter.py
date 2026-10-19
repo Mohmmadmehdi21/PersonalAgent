@@ -2,8 +2,10 @@ import os
 import json
 import tempfile
 import shutil
+import sys
+import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import source_filter
 
@@ -34,6 +36,31 @@ class TestSourceFilter(unittest.TestCase):
         self.assertEqual(source_filter.parse_iso8601_duration("PT1H2M30S"), 3750)
         self.assertIsNone(source_filter.parse_iso8601_duration("invalid"))
         self.assertIsNone(source_filter.parse_iso8601_duration(""))
+
+    def test_duration_lookup_uses_noninteractive_metadata_without_oauth(self):
+        class FakeYoutubeDL:
+            def __init__(self, options):
+                self.options = options
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def extract_info(self, url, download=False):
+                self.assert_no_download = download
+                video_id = url.split("v=", 1)[1]
+                return {"duration": {"LONG_VIDEO1": 600}.get(video_id)}
+
+        ytdlp = types.ModuleType("yt_dlp")
+        ytdlp.YoutubeDL = FakeYoutubeDL
+        upload = types.ModuleType("upload")
+        upload.get_service = Mock(side_effect=AssertionError("duration lookup must not start OAuth"))
+        with patch.dict(sys.modules, {"yt_dlp": ytdlp, "upload": upload}):
+            durations = source_filter.get_video_durations(["LONG_VIDEO1", "UNKNOWN_VID1"])
+        self.assertEqual(durations, {"LONG_VIDEO1": 600.0, "UNKNOWN_VID1": None})
+        upload.get_service.assert_not_called()
 
     def test_filter_candidates_skips_shorts_and_short_videos(self):
         candidates = [

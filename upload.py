@@ -1,10 +1,12 @@
 import os
+import re
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.http import MediaFileUpload
 from retry import (retry_upload, QuotaExceededError, AuthError,
                    AccountUploadLimitError, NonRetryableAPIError,
+                   UploadOutcomeUnknownError,
                    ExternalWriteOutcomeUnknownError, UploadCommittedInterruptedError,
                    build_google_service, call_google_write)
 from logger import log, log_warn, log_error, mask_secrets
@@ -13,6 +15,14 @@ SCOPES = [
     "https://www.googleapis.com/auth/youtube.upload",
     "https://www.googleapis.com/auth/youtube.readonly"
 ]
+
+
+class UploadVideoId(str):
+    """String-compatible YouTube video ID carrying the API-confirmed visibility."""
+    def __new__(cls, video_id, privacy_status):
+        value = super().__new__(cls, video_id)
+        value.privacy_status = privacy_status
+        return value
 
 def get_service():
     creds = None
@@ -60,7 +70,13 @@ def get_service():
 
     return build_google_service("youtube", "v3", creds)
 
-def upload(yt, video, thumb, title, desc, tags):
+def upload(yt, video, thumb, title, desc, tags, *, approval=None, clip_id=None):
+    # Keep the policy at the shared publication boundary so CLI/workflow callers
+    # cannot bypass the Telegram confirmation checkpoint.
+    from upload_auth import consume_upload_approval
+    if not clip_id:
+        raise ValueError("A queue clip ID is required to validate public-upload approval.")
+    consume_upload_approval(approval, clip_id)
     body = {
         "snippet": {
             "title": title[:100],
@@ -88,7 +104,9 @@ def upload(yt, video, thumb, title, desc, tags):
         print(f"\n{msg}\n")
         log_warn(msg)
         raise
-    vid = res["id"]
+    vid = res.get("id") if isinstance(res, dict) else None
+    if not isinstance(vid, str) or not re.fullmatch(r"[A-Za-z0-9_-]{11}", vid):
+        raise RuntimeError("YouTube upload response did not contain a valid video ID; publication was not recorded.")
     privacy = res.get("status", {}).get("privacyStatus")
     if privacy == "private":
         print(
@@ -98,10 +116,12 @@ def upload(yt, video, thumb, title, desc, tags):
     elif privacy == "public":
         print(f"[Upload] Video public upload ho gaya! Video ID: {vid}")
     else:
-        raise RuntimeError(
-            f"YouTube ne video {vid} ka privacy status return nahi kiya "
-            f"(privacyStatus={privacy!r}); upload status confirm nahi ho saka."
+        error = UploadOutcomeUnknownError(
+            f"YouTube returned video ID {vid} without a usable privacy status; verify the upload before retrying."
         )
+        error.video_id = vid
+        error.privacy_status = "unknown"
+        raise error
 
     if os.path.exists(thumb):
         try:
@@ -111,12 +131,12 @@ def upload(yt, video, thumb, title, desc, tags):
             )
             print(f"[Upload] Custom thumbnail set ho gaya!")
         except KeyboardInterrupt as e:
-            raise UploadCommittedInterruptedError(vid) from e
+            raise UploadCommittedInterruptedError(vid, privacy_status=privacy) from e
         except ExternalWriteOutcomeUnknownError as e:
             if "interrupted" in str(e).lower():
-                raise UploadCommittedInterruptedError(vid) from e
+                raise UploadCommittedInterruptedError(vid, privacy_status=privacy) from e
             print(f"[Upload] Thumbnail result unknown for confirmed video {vid}: {mask_secrets(e)}")
         except Exception as e:
             print(f"[Upload] Custom thumbnail set nahi hua ({mask_secrets(e)}). (Channel phone-verified na ho to custom thumbnail allow nahi hota)")
 
-    return vid
+    return UploadVideoId(vid, privacy)

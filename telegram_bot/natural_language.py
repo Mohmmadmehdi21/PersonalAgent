@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -10,12 +11,37 @@ ALLOWED_INTENTS = {
     "analytics", "pending_ready_count", "latest_error", "prepare", "pause", "resume", "help", "clarify"
 }
 
+_LOCAL_PREPARE_REQUESTS = {
+    "prepare clips",
+    "prepare new clips",
+    "prepare clips only",
+    "prepare clips but do not upload",
+    "prepare clips without uploading",
+    "make clips",
+    "make new clips",
+    "create clips",
+    "create new clips",
+    "draft clips",
+    "draft new clips",
+}
+
+
+def _local_intent(text):
+    normalized = re.sub(r"[^a-z0-9']+", " ", str(text or "").lower()).strip()
+    normalized = " ".join(normalized.split())
+    if normalized in _LOCAL_PREPARE_REQUESTS:
+        return {"intent": "prepare", "range": None, "confidence": 1.0}
+    return None
+
 
 def classify(text, *, client_factory=None, model=None):
     """Return only a validated intent object; model output is never treated as code/tools."""
     text = str(text or "").strip()
     if not text or len(text) > 1200:
         return {"intent": "clarify", "range": None, "confidence": 0.0}
+    local = _local_intent(text)
+    if local:
+        return local
     try:
         if client_factory:
             client = client_factory()

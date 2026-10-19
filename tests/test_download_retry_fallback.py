@@ -178,9 +178,11 @@ class DownloadRetryAndFallbackTests(unittest.TestCase):
 
         with patch("main.load_state", return_value=mock_state), \
              patch("main.save_state_atomic") as mock_save, \
+             patch("state_manager.save_state_atomic"), \
              patch("main.load_queue", return_value=[]), \
              patch("main.save_queue"), \
              patch("main.next_source_candidates", return_value=candidates), \
+             patch("main.source_filter.filter_candidates", side_effect=lambda items: items), \
              patch("main.download", side_effect=fake_download), \
              patch("main.transcribe", return_value=[{"start": 0, "end": 30, "text": "Hello"}]) as mock_transcribe, \
              patch("main.find_clips", return_value=usable_clips), \
@@ -208,21 +210,23 @@ class DownloadRetryAndFallbackTests(unittest.TestCase):
 
         with patch("main.load_state", return_value=mock_state), \
              patch("main.save_state_atomic"), \
+             patch("state_manager.save_state_atomic"), \
              patch("main.load_queue", return_value=[]), \
              patch("main.next_source_candidates", return_value=candidates), \
+             patch("main.source_filter.filter_candidates", side_effect=lambda items: items), \
              patch("main.download", side_effect=fake_download), \
              patch("main.notify_run_error") as mock_notify, \
              patch("main._monitor_progress"):
-            main.prepare_stage()
+            with self.assertRaises(RateLimitedError):
+                main.prepare_stage()
             # Candidate 2 must NOT have been called because candidate 1 was rate limited
             self.assertEqual(len(download_calls), 1)
             self.assertEqual(download_calls[0], candidates[0][0])
             self.assertTrue(is_download_cooldown_active(mock_state))
-            mock_notify.assert_called_once()
-            self.assertIn("download_rate_limit", mock_notify.call_args[0][0])
+            mock_notify.assert_not_called()
 
     def test_exhausting_candidate_limit_ends_stage_cleanly(self):
-        # 11. Exhausting the candidate limit ends the stage cleanly (no uncaught exception)
+        # 11. Exhaustion propagates the final evidence to the pipeline boundary for one report.
         import main
 
         mock_state = {"done": [], "videos": {}, "clips": []}
@@ -236,15 +240,17 @@ class DownloadRetryAndFallbackTests(unittest.TestCase):
 
         with patch("main.load_state", return_value=mock_state), \
              patch("main.save_state_atomic"), \
+             patch("state_manager.save_state_atomic"), \
              patch("main.load_queue", return_value=[]), \
              patch("main.next_source_candidates", return_value=candidates), \
+             patch("main.source_filter.filter_candidates", side_effect=lambda items: items), \
              patch("main.download", side_effect=fake_download), \
              patch("main.notify_run_error") as mock_notify, \
              patch("main._monitor_progress"):
-            # Must finish without raising an exception to main
-            main.prepare_stage()
-            mock_notify.assert_called_once()
-            self.assertIn("download_candidates_exhausted", mock_notify.call_args[0][0])
+            with self.assertRaisesRegex(RuntimeError, "All 2 source candidates failed") as raised:
+                main.prepare_stage()
+            self.assertIsInstance(raised.exception.__cause__, BotVerificationError)
+            mock_notify.assert_not_called()
 
     def test_transcription_never_starts_without_valid_downloaded_file(self):
         # 12. Transcription never starts without a valid downloaded file
@@ -255,12 +261,15 @@ class DownloadRetryAndFallbackTests(unittest.TestCase):
 
         with patch("main.load_state", return_value=mock_state), \
              patch("main.save_state_atomic"), \
+             patch("state_manager.save_state_atomic"), \
              patch("main.load_queue", return_value=[]), \
              patch("main.next_source_candidates", return_value=candidates), \
+             patch("main.source_filter.filter_candidates", side_effect=lambda items: items), \
              patch("main.download", side_effect=PermanentSourceError("Video unavailable")), \
              patch("main.transcribe") as mock_transcribe, \
              patch("main._monitor_progress"):
-            main.prepare_stage()
+            with self.assertRaises(RuntimeError):
+                main.prepare_stage()
             mock_transcribe.assert_not_called()
 
     def test_queue_contents_unchanged_when_download_fails(self):
@@ -273,12 +282,16 @@ class DownloadRetryAndFallbackTests(unittest.TestCase):
 
         with patch("main.load_state", return_value=mock_state), \
              patch("main.save_state_atomic"), \
+             patch("state_manager.save_state_atomic"), \
              patch("main.load_queue", return_value=initial_queue), \
              patch("main.save_queue") as mock_save_queue, \
              patch("main.next_source_candidates", return_value=candidates), \
+             patch("main.source_filter.filter_candidates", side_effect=lambda items: items), \
              patch("main.download", side_effect=BotVerificationError("bot verification")), \
+             patch("main.notify_run_error"), \
              patch("main._monitor_progress"):
-            main.prepare_stage()
+            with self.assertRaises(RuntimeError):
+                main.prepare_stage()
             mock_save_queue.assert_not_called()
             self.assertEqual(len(initial_queue), 1)
 
@@ -301,7 +314,9 @@ class DownloadRetryAndFallbackTests(unittest.TestCase):
         # 15. Telegram notifications are sent correctly without exposing credentials
         import notify
 
-        with patch("notify.send_telegram_to") as mock_send:
+        with patch.dict(os.environ, {"NOTIFY_CHANNEL": "telegram", "TELEGRAM_BOT_TOKEN": "test-token",
+                                     "TELEGRAM_CHAT_ID": "test-chat"}), \
+             patch("notify.send_telegram_to") as mock_send:
             secret_msg = "Error with ya29.SECRET_TOKEN and cookies.txt in /home/user/cookies.txt"
             notify.notify_run_error("download_rate_limit", secret_msg, video_id="test_vid")
             mock_send.assert_called_once()

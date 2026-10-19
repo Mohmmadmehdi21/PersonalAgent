@@ -55,7 +55,7 @@ class TestDuplicateGuard(unittest.TestCase):
         with open("state.json", "w", encoding="utf-8") as f:
             json.dump(state_data, f)
 
-        # Run bootstrap
+        # Run bootstrap against the temporary working directory only.
         guard.bootstrap()
 
         ledger = guard.load_ledger()

@@ -1,9 +1,14 @@
-import json, os, sys, time
+import json, os, sys, time, re, traceback, errno, subprocess
 
 if len(sys.argv) > 1 and sys.argv[1] == "telegram-bot":
     try:
+        from config import validate_startup_config, ConfigurationError
+        validate_startup_config("telegram-bot")
         from telegram_bot.poller import run_bot
         run_bot()
+    except ConfigurationError as config_err:
+        print(f"[Config] {config_err}")
+        raise SystemExit(2)
     except KeyboardInterrupt:
         print("Telegram bot stopped.")
     except Exception as telegram_error:
@@ -57,6 +62,7 @@ from find_clips import find_clips
 from clip import make_clip, write_srt
 from thumb import make_thumb
 from upload import get_service, upload
+from upload_auth import UploadApprovalRequiredError
 from commentary import apply_commentary
 try:
     import guard
@@ -87,7 +93,8 @@ from retry import (
     QuotaExceededError, AuthError, PermanentSourceError, FatalError,
     AccountUploadLimitError, UploadOutcomeUnknownError, UploadCommittedInterruptedError,
     ModelNotFoundError, ProviderQuotaError, BotVerificationError, RateLimitedError,
-    is_download_cooldown_active, get_download_cooldown_remaining, set_download_cooldown
+    is_download_cooldown_active, get_download_cooldown_remaining, set_download_cooldown,
+    youtube_error_details, classify_error
 )
 from state_manager import (
     load_state, save_state_atomic, init_video_state, update_step_status,
@@ -96,7 +103,7 @@ from state_manager import (
 )
 from notify import (
     notify_run_success, notify_run_error, notify_quota_or_auth,
-    notify_queue_empty
+    notify_queue_empty, notify_upload_summary
 )
 from cleanup import run_cleanup
 from queue_manager import load_queue as _load_persistent_queue, save_queue as _save_persistent_queue, add_if_new
@@ -114,6 +121,92 @@ def _monitor_progress(stage, task, *, message=None):
                 send_telegram_to(chat_id, f"PersonalAgent: {message}")
         except Exception as progress_error:
             log_warn(f"[Monitoring] Progress notification failed safely: {progress_error}")
+
+
+def _report_preparation_failure(exc, *, stage=None, task_id=None):
+    """Send one evidence-based, redacted report at the pipeline boundary."""
+    try:
+        from telegram_bot.monitoring import read_registry
+        progress = read_registry()
+    except Exception:
+        progress = {}
+    stage = str(stage or progress.get("current_task") or progress.get("stage") or "unknown")[:80]
+    cause = exc
+    while getattr(cause, "__cause__", None) is not None:
+        cause = cause.__cause__
+    lowered = stage.lower()
+    service = "groq" if any(word in lowered for word in ("analyze", "find_clips", "transcribe")) else "generic"
+    classification = classify_error(cause, service=service)
+    if isinstance(cause, ModuleNotFoundError):
+        category = "missing_dependency"
+    elif isinstance(cause, FileNotFoundError):
+        category = "missing_file_or_executable"
+    elif isinstance(cause, PermissionError):
+        category = "permission_denied"
+    elif isinstance(cause, OSError) and cause.errno == errno.ENOSPC:
+        category = "insufficient_disk_space"
+    elif isinstance(cause, json.JSONDecodeError):
+        category = "invalid_response"
+    elif isinstance(cause, subprocess.CalledProcessError) and any(word in lowered for word in ("render", "encode", "media", "clip")):
+        category = "media_processing_failure"
+    else:
+        category = classification.category
+    status = getattr(getattr(cause, "resp", None), "status", None) or getattr(cause, "status_code", None)
+    if status is None:
+        match = re.search(r"\bHTTP(?:\s*Error)?\s*[: ]?\s*(\d{3})\b", str(cause), re.I)
+        status = match.group(1) if match else None
+    actual = re.sub(r"(https?://[^\s?]+)\?[^\s]+", r"\1?<query redacted>", str(cause))
+    try:
+        from logger import mask_secrets
+        actual = mask_secrets(actual)[:350]
+    except Exception:
+        actual = "[error details suppressed]"
+    next_step = {
+        "authentication": "Check the configured provider credentials and permissions, then retry.",
+        "rate_limited": "Wait for the reported cooldown/rate limit to clear before retrying.",
+        "timeout": "Check network reachability and retry the task.",
+        "network": "Check network reachability and retry the task.",
+        "missing_dependency": "Install the missing package from the declared project requirements in the active environment.",
+        "missing_file_or_executable": "Verify the referenced input file or required executable is installed and reachable.",
+        "permission_denied": "Check filesystem permissions for the reported operation.",
+        "insufficient_disk_space": "Free disk space on the processing volume, then retry.",
+        "invalid_response": "Inspect the redacted API response and request parameters.",
+        "media_processing_failure": "Inspect the media-tool stderr and validate the source media before retrying.",
+        "permanent_source": "Verify the source video is public and available; replace it with a valid source if needed.",
+        "bot_verification": "Review the source access challenge; if authentication is legitimately required, configure the supported downloader cookies.",
+        "unexpected": "Inspect the redacted application traceback for the failing operation.",
+        "permanent_http": "Review the API request and returned status before retrying.",
+    }.get(category, "Inspect the redacted application traceback before retrying.")
+    paused = category in {"rate_limited", "timeout", "network"}
+    task_id = str(task_id or os.getenv("AGENT_CONTROL_TASK_ID", "").strip() or "unavailable")
+    label = "Pipeline task" if "render" in lowered or "clip" in lowered else "Preparation"
+    recovery = "processing paused; recoverable after cooldown" if paused else "recoverable after correction"
+    report = (f"{label} failed; task status is failed ({recovery}).\n"
+              f"Task: {task_id}\nStage: {stage}\nError: {type(cause).__name__} ({category})"
+              f"{f', HTTP {status}' if status else ''}\n"
+              f"Cause assessment: {'undetermined from available evidence' if category == 'unexpected' else category}.\n"
+              f"Reason: {actual}\nNext step: {next_step}")
+    notification_sent = False
+    notification_error = None
+    try:
+        from notify import send_telegram_to, notify_run_error
+        chat_id = os.getenv("AGENT_CONTROL_CHAT_ID", "").strip()
+        if chat_id:
+            notification_sent = bool(send_telegram_to(chat_id, report))
+            if not notification_sent:
+                notification_error = "Telegram did not confirm delivery."
+                log_warn("[Prepare] Owner failure notification was not delivered; original error is preserved.")
+        else:
+            notify_run_error(f"prepare:{stage}", report)
+    except Exception as notify_error:
+        notification_error = notify_error
+        log_warn(f"[Prepare] Owner failure notification failed: {notify_error}")
+    if task_id != "unavailable":
+        try:
+            from telegram_bot.control import record_notification_result
+            record_notification_result(task_id, "preparation_failure", notification_sent, notification_error)
+        except Exception as state_error:
+            log_warn(f"[Prepare] Could not record notification delivery state: {state_error}")
 
 def load_queue():
     return _load_persistent_queue(QUEUE_FILE)
@@ -254,6 +347,11 @@ def build_description(caption, hashtags, item):
     tags_str = " ".join(f"#{h.lstrip('#')}" for h in hashtags)
     return f"{caption}\n\n{tags_str}{credit}"
 
+def _draft_clip_id(source_id, start, end):
+    """Stable, filesystem-safe identity for one source time range."""
+    return f"{source_id}_{int(start)}_{int(end)}"
+
+
 def prepare_stage(source_fallbacks=0):
     """
     Stage 1: Download, transcribe, Groq commentary analysis, queue creation.
@@ -364,6 +462,7 @@ def prepare_stage(source_fallbacks=0):
     url = None
     note = None
 
+    last_download_error = None
     for candidate_url, candidate_note in candidates:
         try:
             from telegram_bot.control import checkpoint
@@ -393,6 +492,7 @@ def prepare_stage(source_fallbacks=0):
             log(f"[Prepare] Video ready ({video_id}): {src}")
             break
         except PermanentSourceError as pse:
+            last_download_error = pse
             log_error(f"[Prepare] Permanent source error for {candidate_url}: {pse}")
             log_event("task_result", task="prepare:download", status="skipped",
                       error_category="permanent_source", error=str(pse)[:500])
@@ -409,6 +509,7 @@ def prepare_stage(source_fallbacks=0):
             print(f"[Skip] Video {candidate_url} unavailable/restricted. Trying next candidate...")
             continue
         except BotVerificationError as bve:
+            last_download_error = bve
             log_error(f"[Prepare] Bot verification required for {candidate_url}: {bve}")
             log_event("task_result", task="prepare:download", status="failure",
                       error_category="bot_verification", error=str(bve)[:500])
@@ -424,6 +525,7 @@ def prepare_stage(source_fallbacks=0):
             print(f"[Auth] Bot verification required for {candidate_url}. Trying next candidate...")
             continue
         except RateLimitedError as rle:
+            last_download_error = rle
             log_error(f"[Prepare] Rate limited (HTTP 429) downloading {candidate_url}: {rle}")
             log_event("task_result", task="prepare:download", status="failure",
                       error_category="rate_limited", error=str(rle)[:500])
@@ -437,15 +539,10 @@ def prepare_stage(source_fallbacks=0):
                     source_memory.mark_transient_failure(cand_vid, f"HTTP 429 Rate Limited: {str(rle)[:200]}")
             except Exception:
                 pass
-            notify_run_error(
-                "download_rate_limit",
-                f"YouTube HTTP 429 Rate Limit. Pausing downloads for {YTDLP_RATE_LIMIT_COOLDOWN_SECONDS}s. "
-                "Configure legitimate cookies (YTDLP_COOKIES_FILE or YTDLP_COOKIES_FROM_BROWSER) or wait for cooldown.",
-                video_id=cand_vid,
-            )
             print(f"[RateLimit] Rate limit active. Cooldown set for {YTDLP_RATE_LIMIT_COOLDOWN_SECONDS}s.")
-            return
+            raise
         except Exception as e:
+            last_download_error = e
             log_error(f"[Prepare] Download failed for {candidate_url}: {e}")
             log_event("task_result", task="prepare:download", status="failure",
                       error_category=type(e).__name__, error=str(e)[:500])
@@ -463,12 +560,10 @@ def prepare_stage(source_fallbacks=0):
 
     if not src or not info:
         log_error(f"[Prepare] All {len(candidates)} candidate video(s) failed to download.")
-        notify_run_error(
-            "download_candidates_exhausted",
-            f"All {len(candidates)} source candidate(s) failed to download. "
-            "If YouTube requires bot verification, configure YTDLP_COOKIES_FILE or YTDLP_COOKIES_FROM_BROWSER.",
-        )
-        return
+        details = last_download_error
+        if details is None:
+            details = BotVerificationError("All source candidates required bot verification or were unavailable.")
+        raise RuntimeError(f"All {len(candidates)} source candidates failed; last error: {details}") from details
 
     try:
         guard.claim(info["id"], url)
@@ -499,8 +594,10 @@ def prepare_stage(source_fallbacks=0):
         log_error(f"[Prepare] Transcription failed: {e}")
         log_event("task_result", task="prepare:transcribe", status="failure",
                   error_category=type(e).__name__, error=str(e)[:500])
-        update_step_status(state, video_id, "transcribe", "failed", error=str(e))
-        notify_run_error("transcribe", str(e), video_id=video_id)
+        try:
+            update_step_status(state, video_id, "transcribe", "failed", error=str(e))
+        except Exception as state_error:
+            log_error(f"[Prepare] Could not persist transcription failure status: {state_error}")
         raise
 
     # Step C: Groq Analysis & Commentary Drafting
@@ -545,14 +642,12 @@ def prepare_stage(source_fallbacks=0):
             failure_type = "Groq API Error"
         log_event("task_result", task="prepare:find_clips", status="failure",
                   error_category=type(fe).__name__, error=str(fe)[:500])
-        notify_quota_or_auth(failure_type, str(fe))
         raise
     except Exception as e:
         log_error(f"[Prepare] find_clips failed: {e}")
         update_step_status(state, video_id, "find_clips", "failed", error=str(e))
         log_event("task_result", task="prepare:find_clips", status="failure",
                   error_category=type(e).__name__, error=str(e)[:500])
-        notify_run_error("find_clips", str(e), video_id=video_id)
         raise
 
     try:
@@ -650,7 +745,9 @@ def prepare_stage(source_fallbacks=0):
             continue
 
         item = {
-            "id": f"{info['id']}_{i}",
+            # The list index is not stable across source refreshes; range-based
+            # IDs keep separate highlights from sharing confirmation/file names.
+            "id": _draft_clip_id(info["id"], c["start"], c["end"]),
             "source_id": info["id"],
             "source_title": info.get("title", ""),
             "source_uploader": info.get("uploader", ""),
@@ -723,13 +820,19 @@ def render_stage():
 
     clips_to_process = [
         item for item in queue
-        if item.get("status") in ("pending", "needs_review", None)
+        if item.get("status") in ("pending", None)
     ]
     if not clips_to_process:
         print("\n[Render] Koi pending clips process karne ke liye nahi hain.\n")
         return
 
     control_task_id = os.getenv("AGENT_CONTROL_TASK_ID", "").strip()
+    if not DRY_RUN and not control_task_id:
+        message = "Live publishing requires an owner-controlled Telegram task and per-clip confirmation."
+        log_error(f"[Render] {message}")
+        log_event("task_result", task="render_stage", status="failure",
+                  error_category="approval_required", error=message)
+        return
     if control_task_id:
         try:
             from telegram_bot.control import associate_clips
@@ -760,6 +863,7 @@ def render_stage():
 
     rendered_files = []
     succeeded_clips = []
+    upload_attempted_count = 0
     failed_clips = []
     batch_stopped_reason = None
     t_stage_start = time.time()
@@ -867,6 +971,7 @@ def render_stage():
                 except Exception as e:
                     print(f"[Guard] warning (ignored): {e}")
             else:
+                approval = None
                 if control_task_id:
                     from telegram_bot.control import checkpoint
                     permission = checkpoint(clip=item, ask_upload=True)
@@ -876,18 +981,36 @@ def render_stage():
                         item.pop("processing_started_at", None)
                         save_queue(queue)
                         break
-                    if permission != "continue":
+                    from upload_auth import UploadApproval
+                    if permission == "denied":
                         item["status"] = "pending"
-                        item["last_result"] = "upload_confirmation_not_granted"
+                        item["last_result"] = "upload_confirmation_denied"
                         item.pop("processing_step", None)
                         item.pop("processing_started_at", None)
                         save_queue(queue)
                         continue
+                    if not isinstance(permission, UploadApproval):
+                        batch_stopped_reason = "upload confirmation state unavailable; batch paused safely"
+                        item["status"] = "failed"
+                        item["last_result"] = "upload_confirmation_unavailable"
+                        item["last_error"] = "The confirmation state could not be matched to this task and clip; no upload request was sent."
+                        item.pop("processing_step", None)
+                        item.pop("processing_started_at", None)
+                        save_queue(queue)
+                        failed_clips.append({"title": item.get("title", item.get("id", key)),
+                                             "error": "approval_required: confirmation could not be safely validated; no upload request was sent. Check /task and /queue before retrying.",
+                                             "error_category": "approval_required"})
+                        log_event("task_result", task=f"clip:{item.get('id', key)}", status="failure",
+                                  error_category="approval_required", error="Confirmation did not match the active task and clip.")
+                        break
+                    approval = permission
                 print("[Main] YouTube par public upload ho raha hai...")
                 item["processing_step"] = "uploading"
                 item["upload_started_at"] = time.time()
                 save_queue(queue)
-                vid = upload(yt, final_clip, thumb_file, item["title"], desc, item["hashtags"])
+                upload_attempted_count += 1
+                vid = upload(yt, final_clip, thumb_file, item["title"], desc, item["hashtags"],
+                             approval=approval, clip_id=item.get("id"))
                 try:
                     if os.getenv("TRACKING_ENABLED", "false").strip().lower() in ("true", "1", "t", "yes"):
                         from growth.tracker import record_upload
@@ -897,6 +1020,7 @@ def render_stage():
                 state.setdefault("clips", []).append(key)
                 item["status"] = "uploaded"
                 item["youtube_video_id"] = vid
+                item["youtube_privacy_status"] = getattr(vid, "privacy_status", "unknown")
                 item.pop("processing_step", None)
                 item.pop("processing_started_at", None)
                 item.pop("upload_started_at", None)
@@ -907,7 +1031,7 @@ def render_stage():
                 log(f"[Uploaded] Clip uploaded successfully: {vid} ({item['title']})")
                 succeeded_clips.append(item)
                 log_event("task_result", task=f"clip:{item.get('id', key)}", status="success",
-                          youtube_video_id=vid)
+                          youtube_video_id=str(vid), privacy_status=item["youtube_privacy_status"])
 
                 if item.get("is_own"):
                     archive_own_video(item["source_video_path"])
@@ -916,9 +1040,31 @@ def render_stage():
                 except Exception as e:
                     print(f"[Guard] warning (ignored): {e}")
 
+        except UploadApprovalRequiredError as approval_error:
+            # The shared upload boundary rejected this before YouTube's insert call.
+            # Keep the clip retryable and stop the batch rather than treating it as
+            # an uncertain publication or moving on to another clip.
+            batch_stopped_reason = "required owner upload approval was not accepted"
+            item["status"] = "failed"
+            item["last_error"] = str(approval_error)
+            item["last_result"] = "upload_approval_required"
+            item.pop("processing_step", None)
+            item.pop("processing_started_at", None)
+            item.pop("upload_started_at", None)
+            update_clip_step(state, video_id, key, "upload", "failed", error=str(approval_error))
+            failed_clips.append({"title": item.get("title", item.get("id", key)),
+                                 "error": ("approval_required: owner approval was not accepted; no YouTube upload request was sent. "
+                                           "Fix the approval handoff, then retry this failed clip through the owner command."),
+                                 "error_category": "approval_required"})
+            log_event("task_result", task=f"clip:{item.get('id', key)}", status="failure",
+                      error_category="approval_required", error=str(approval_error)[:300])
+            print(f"\n[UPLOAD STOPPED] Owner approval was not accepted for '{item.get('title', key)}'; no upload request was sent.\n")
+            break
+
         except UploadCommittedInterruptedError as committed_error:
             item["status"] = "uploaded"
             item["youtube_video_id"] = committed_error.video_id
+            item["youtube_privacy_status"] = committed_error.privacy_status or "unknown"
             item.pop("processing_step", None)
             item.pop("processing_started_at", None)
             item.pop("upload_started_at", None)
@@ -927,30 +1073,49 @@ def render_stage():
             batch_stopped_reason = "interrupted after confirmed upload"
             succeeded_clips.append(item)
             log_event("task_interrupted_after_commit", task=f"clip:{item.get('id', key)}",
-                      video_id=committed_error.video_id)
+                      video_id=committed_error.video_id, privacy_status="unknown")
             print(f"[INTERRUPTED] Upload {committed_error.video_id} succeeded; stopping before the next clip.")
             break
 
         except AccountUploadLimitError as limit_error:
             reason = "uploadLimitExceeded"
+            original_api_error = limit_error
+            while getattr(original_api_error, "__cause__", None) is not None:
+                original_api_error = original_api_error.__cause__
+            api_details = youtube_error_details(original_api_error)
             batch_stopped_reason = reason
             item["status"] = "blocked"
             item["upload_error"] = reason
+            item["upload_error_details"] = api_details
             update_clip_step(state, video_id, key, "upload", "blocked", error=reason)
             save_queue(queue)
             failed_clips.append({"title": item.get("title", item.get("id", key)), "error": reason})
             limit_msg = "[Quota Limit] Aaj ki upload limit poori ho chuki hai. Clips local 'work/' folder mein saved hain."
             print(f"\n{limit_msg}\n")
             log_warn(limit_msg)
+            reason_detail = ", ".join(
+                f"{detail.get('domain', 'API')}/{detail.get('reason', 'unknown')}"
+                for detail in api_details.get("details", [])
+            ) or api_details.get("api_status") or reason
             message = (
                 f"YouTube account upload limit reached for clip '{item.get('title', key)}' "
-                f"({item.get('id', key)}): {reason}. Current clip is blocked; "
-                "remaining clips were left queued. Resolve the YouTube account restriction, then rerun."
+                f"({item.get('id', key)}): {reason_detail}; HTTP {api_details.get('http_status') or 'unknown'}. "
+                "Current clip is preserved as blocked and later clips remain queued. Verify the YouTube account/channel status in Studio. "
+                "After resolving it, use the existing owner-authorized retry/approval flow; uploads will not resume automatically."
             )
-            log_error(f"[Upload] {message} Details: {limit_error}")
+            log_error(f"[Upload] {message} API details: {api_details}")
             log_event("task_result", task=f"clip:{item.get('id', key)}", status="failure",
-                      error_category="account_upload_limit", error=str(limit_error)[:500])
-            notify_quota_or_auth("YouTube Account Upload Limit Reached", message)
+                      error_category="account_upload_limit", error=f"{reason_detail}; HTTP {api_details.get('http_status') or 'unknown'}")
+            try:
+                from notify import send_telegram_to
+                owner_chat = os.getenv("AGENT_CONTROL_CHAT_ID", "").strip()
+                if owner_chat:
+                    if not send_telegram_to(owner_chat, message):
+                        log_warn("[Upload] Account-limit notification was not delivered; queue state is preserved.")
+                else:
+                    notify_quota_or_auth("YouTube Account Upload Limit Reached", message)
+            except Exception as notify_error:
+                log_warn(f"[Upload] Account-limit notification failed safely: {notify_error}")
             print(f"\n[UPLOAD PAUSED] {message}\n")
             break
 
@@ -958,6 +1123,9 @@ def render_stage():
             batch_stopped_reason = "upload outcome uncertain; manual verification required"
             item["status"] = "needs_review"
             item["upload_error"] = str(unknown_error)
+            if getattr(unknown_error, "video_id", None):
+                item["youtube_video_id"] = unknown_error.video_id
+                item["youtube_privacy_status"] = getattr(unknown_error, "privacy_status", "unknown")
             save_queue(queue)
             update_clip_step(state, video_id, key, "upload", "uncertain", error=str(unknown_error))
             failed_clips.append({"title": item.get("title", item.get("id", key)), "error": "upload outcome uncertain; manual verification required"})
@@ -1028,7 +1196,8 @@ def render_stage():
             item["attempt_count"] = int(item.get("attempt_count", 0)) + 1
             log_error(f"[Clip Failure] Error processing clip '{item['title']}': {clip_err}")
             update_clip_step(state, video_id, key, "cut", "failed", error=str(clip_err))
-            failed_clips.append({"title": item["title"], "error": str(clip_err)})
+            failed_clips.append({"title": item["title"], "error": str(clip_err),
+                                 "_exception": clip_err, "_stage": item.get("processing_step") or "clip processing"})
             state.setdefault("failed_video_ids", [])
             if video_id not in state["failed_video_ids"]:
                 state["failed_video_ids"].append(video_id)
@@ -1099,10 +1268,26 @@ def render_stage():
 
     # Send Notification
     total_time = time.time() - t_stage_start
-    if succeeded_clips:
+    if not DRY_RUN and clips_to_process:
+        queue_failed = sum(item.get("status") in {"failed", "blocked"} for item in clips_to_process)
+        queue_pending = sum(item.get("status") == "pending" for item in clips_to_process)
+        queue_review = sum(item.get("status") == "needs_review" for item in clips_to_process)
+        notify_upload_summary(control_task_id, succeeded_clips, failed_clips, total_time,
+                              upload_attempted_count, queue_pending, queue_review,
+                              stopped_reason=batch_stopped_reason, failed_count=queue_failed)
+    elif succeeded_clips:
         notify_run_success(succeeded_clips, total_time, is_dry_run=DRY_RUN, freed_space_str=freed_str)
-    elif failed_clips:
-        notify_run_error("render_stage", failed_clips[0]["error"], video_id=clips_to_process[0].get("source_id"))
+    diagnostic_failure = next((item for item in failed_clips if item.get("_exception") is not None), None)
+    if diagnostic_failure:
+        try:
+            _monitor_progress("render", f"clip {diagnostic_failure.get('title', 'unknown')} {diagnostic_failure.get('_stage')}")
+            _report_preparation_failure(diagnostic_failure["_exception"])
+        except Exception as report_error:
+            log_warn(f"[Render] Failure report could not be built or sent: {report_error}")
+    elif DRY_RUN and failed_clips and not succeeded_clips:
+        first_failure = failed_clips[0]
+        notify_run_error(first_failure.get("error_category", "render_stage"), first_failure["error"],
+                         video_id=clips_to_process[0].get("source_id"))
     log_event("task_result", task="render_stage",
               status="failure" if failed_clips else "success",
               succeeded=len(succeeded_clips), failed=len(failed_clips),
@@ -1144,9 +1329,36 @@ def main():
                 from telegram_bot.control import finish, task_info
                 task = task_info(control_task_id) or {}
                 associated = set(task.get("clip_ids", []))
-                clip_states = [x.get("status") for x in load_queue() if str(x.get("id", "")) in associated]
+                queue_snapshot = load_queue()
+                associated_items = [x for x in queue_snapshot
+                                    if isinstance(x, dict) and str(x.get("id", "")) in associated]
+                clip_states = [x.get("status") for x in associated_items]
+                result = None
+                if task.get("kind") == "prepare":
+                    verified = [item for item in associated_items
+                                if item.get("status") in {"pending", "needs_review"}
+                                and str(item.get("id", "")).strip()
+                                and str(item.get("title", "")).strip()]
+                    result = {"verified_draft_count": len(verified),
+                              "clip_ids": [str(item["id"]) for item in verified]}
+                elif task.get("kind") == "upload":
+                    result = {
+                        "selected": len(associated_items),
+                        "uploaded": sum(x.get("status") == "uploaded" and bool(x.get("youtube_video_id"))
+                                         for x in associated_items),
+                        "failed_or_blocked": sum(x.get("status") in {"failed", "blocked"}
+                                                  for x in associated_items),
+                        "pending": sum(x.get("status") == "pending" for x in associated_items),
+                        "needs_review": sum(x.get("status") == "needs_review" for x in associated_items),
+                        "publications": sum(x.get("youtube_privacy_status") == "public"
+                                            for x in associated_items),
+                    }
                 if task.get("cancel_requested"):
                     status = "cancelled"
+                elif task.get("kind") == "prepare":
+                    # Review state belongs to each queue item; preparation itself can finish
+                    # successfully while its drafts remain pending human review.
+                    status = "failed" if any(state in {"failed", "blocked"} for state in clip_states) else "completed"
                 elif "blocked" in clip_states:
                     status = "blocked"
                 elif "needs_review" in clip_states:
@@ -1155,10 +1367,17 @@ def main():
                     status = "failed"
                 else:
                     status = "completed"
-                finish(control_task_id, status)
+                finish(control_task_id, status, result=result)
             except Exception as control_error:
                 log_warn(f"[Telegram Control] Could not finalize task: {control_error}")
     except Exception as e:
+        failure_stage = None
+        try:
+            from telegram_bot.monitoring import read_registry
+            registry = read_registry()
+            failure_stage = registry.get("current_task") or registry.get("stage")
+        except Exception as stage_error:
+            log_warn(f"[Monitoring] Could not preserve failing stage before cleanup: {stage_error}")
         if control_task_id:
             try:
                 from telegram_bot.control import finish
@@ -1170,8 +1389,14 @@ def main():
             finish_run("failed", error=e)
         except Exception:
             pass
-        log_error(f"[Main Crash] Unhandled exception: {e}")
-        notify_run_error("main_pipeline", str(e))
+        log_error("[Main Crash] Unhandled exception with traceback:\n" + traceback.format_exc())
+        if "cleanup" not in args and "render" not in args:
+            try:
+                _report_preparation_failure(e, stage=failure_stage, task_id=control_task_id)
+            except Exception as report_error:
+                log_warn(f"[Prepare] Failure report could not be built or sent; original exception preserved: {report_error}")
+        else:
+            notify_run_error("main_pipeline", str(e))
         raise
     except KeyboardInterrupt:
         try:

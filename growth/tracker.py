@@ -2,6 +2,7 @@
 import csv
 import os
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -30,10 +31,20 @@ def _atomic_csv(rows):
             writer.writerows(rows)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temp_path, VIDEOS_FILE)
+        for attempt in range(10):
+            try:
+                os.replace(temp_path, VIDEOS_FILE)
+                break
+            except PermissionError:
+                if attempt == 9:
+                    raise
+                time.sleep(0.05)
     finally:
         if os.path.exists(temp_path):
-            os.unlink(temp_path)
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
 
 
 def read_videos():
