@@ -4,10 +4,17 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import av
-import transcribe
+try:
+    import av
+    import transcribe
+    HAS_TRANSCRIBE_DEPS = True
+except ImportError:
+    av = None
+    transcribe = None
+    HAS_TRANSCRIBE_DEPS = False
 
 
+@unittest.skipUnless(HAS_TRANSCRIBE_DEPS, "PyAV and faster-whisper dependencies are required for PyAV compatibility tests.")
 class PyAVCompatibilityTests(unittest.TestCase):
     def test_transcribe_adapts_removed_metadata_errors_keyword_on_pyav_19(self):
         calls = []

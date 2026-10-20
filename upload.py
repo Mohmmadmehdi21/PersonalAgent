@@ -1,9 +1,17 @@
 import os
 import re
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.http import MediaFileUpload
+try:
+    from google.auth.transport.requests import Request
+    from google.oauth2.credentials import Credentials
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from googleapiclient.http import MediaFileUpload
+    HAS_GOOGLE_AUTH = True
+except ImportError:
+    Request = None
+    Credentials = None
+    InstalledAppFlow = None
+    MediaFileUpload = None
+    HAS_GOOGLE_AUTH = False
 from retry import (retry_upload, QuotaExceededError, AuthError,
                    AccountUploadLimitError, NonRetryableAPIError,
                    UploadOutcomeUnknownError,
@@ -25,6 +33,8 @@ class UploadVideoId(str):
         return value
 
 def get_service():
+    if not HAS_GOOGLE_AUTH:
+        raise ImportError("google-api-python-client and google-auth packages are required for YouTube upload.")
     creds = None
 
     # 1. token.json check
@@ -71,6 +81,8 @@ def get_service():
     return build_google_service("youtube", "v3", creds)
 
 def upload(yt, video, thumb, title, desc, tags, *, approval=None, clip_id=None):
+    if not HAS_GOOGLE_AUTH or MediaFileUpload is None:
+        raise ImportError("google-api-python-client and google-auth packages are required for YouTube upload.")
     # Keep the policy at the shared publication boundary so CLI/workflow callers
     # cannot bypass the Telegram confirmation checkpoint.
     from upload_auth import consume_upload_approval

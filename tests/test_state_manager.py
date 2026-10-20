@@ -61,6 +61,35 @@ class StatePersistenceTests(unittest.TestCase):
             self.assertEqual(json.loads(state_path.read_text(encoding="utf-8")), {"done": ["recovered"]})
             self.assertEqual(list(Path(temp).glob(".state-*.tmp")), [])
 
+    def test_serialization_error_preserves_previous_file_and_cleans_temporary_files(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as temp:
+            state_path = Path(temp) / "state.json"
+            original = {"done": ["stable"]}
+            state_path.write_text(json.dumps(original), encoding="utf-8")
+            with patch.object(state_manager, "STATE_FILE", str(state_path)):
+                with self.assertRaisesRegex(RuntimeError, r"serializing state \(TypeError\).*preserved"):
+                    state_manager.save_state_atomic({"unserializable": object()})
+            self.assertEqual(json.loads(state_path.read_text(encoding="utf-8")), original)
+            self.assertEqual(list(Path(temp).glob(".state-*.tmp")), [])
+
+    def test_permanent_replace_failure_reports_stage_and_exception_accurately(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as temp:
+            state_path = Path(temp) / "state.json"
+            original = {"done": ["old"]}
+            state_path.write_text(json.dumps(original), encoding="utf-8")
+            with patch.object(state_manager, "STATE_FILE", str(state_path)), \
+                 patch.object(state_manager.os, "replace", side_effect=PermissionError("disk access denied")), \
+                 patch.object(state_manager.time, "sleep"):
+                with self.assertRaises(RuntimeError) as ctx:
+                    state_manager.save_state_atomic({"done": ["new"]})
+                msg = str(ctx.exception)
+                self.assertIn("replacing state file", msg)
+                self.assertIn("PermissionError", msg)
+                self.assertIn("state.json", msg)
+                self.assertIn("the previous file was preserved", msg)
+            self.assertEqual(json.loads(state_path.read_text(encoding="utf-8")), original)
+            self.assertEqual(list(Path(temp).glob(".state-*.tmp")), [])
+
 
 if __name__ == "__main__":
     unittest.main()
