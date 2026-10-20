@@ -528,7 +528,10 @@ def _status(_message, queue_reader=None, monitor_reader=None):
         lines.append("Queue: " + ", ".join(f"{state}={count}" for state, count in counts.items()))
         return "\n".join(lines)
     terminal_tasks = [task for task in control_data.get("tasks", {}).values()
-                      if isinstance(task, dict) and task.get("status") in {"completed", "failed", "cancelled"}]
+                      if isinstance(task, dict) and task.get("status") in {
+                          "completed", "failed", "cancelled", "finalization_error",
+                          "interrupted", "no_eligible_clips", "blocked"
+                      }]
     if terminal_tasks:
         task = terminal_tasks[-1]
         registry_data = (monitor_reader or monitoring.read_registry)()
@@ -540,6 +543,9 @@ def _status(_message, queue_reader=None, monitor_reader=None):
         if task.get("error"):
             lines.append("Failure: " + monitoring.mask_secrets(str(task["error"])[:180]))
             lines.append("Next step: inspect the saved failure detail and use the existing owner-controlled recovery path.")
+        result = task.get("result")
+        if isinstance(result, dict) and result.get("uploaded_video_ids"):
+            lines.append("Uploaded Video IDs: " + ", ".join(str(vid) for vid in result["uploaded_video_ids"][:5]))
         if not registry_data.get("last_publication_at"):
             lines.append("Last upload marker: not recorded.")
         elif registry_data.get("last_publication_visibility") == "public":
@@ -799,6 +805,8 @@ def _task(args, queue_reader=None, monitor_reader=None):
                     + f", uploaded={int(result.get('uploaded', 0) or 0)}"
                     + f", publications={int(result.get('publications', 0) or 0)}"
                 )
+                if result.get("uploaded_video_ids"):
+                    parts.append(f"Video IDs: {', '.join(str(vid) for vid in result['uploaded_video_ids'][:5])}")
             try:
                 from telegram_bot.progress import get_task_progress
                 prog = get_task_progress(task_id)

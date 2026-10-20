@@ -120,12 +120,82 @@ def reconcile_tasks(data=None):
                 except Exception:
                     alive = False
                 if not alive:
-                    task["status"] = "cancelled" if task.get("cancel_requested") else "failed"
-                    task["error"] = "Worker process terminated unexpectedly; reconciled on restart."
+                    task_id = task.get("id")
+                    kind = task.get("kind")
+                    clip_ids = list(task.get("clip_ids", []))
+                    if task.get("target_clip_id") and task.get("target_clip_id") not in clip_ids:
+                        clip_ids.append(task.get("target_clip_id"))
+
+                    queue_items = []
+                    if clip_ids:
+                        try:
+                            from queue_manager import load_queue
+                            queue_path = Path(os.getenv("REVIEW_DIR", "review")) / "queue.json"
+                            if queue_path.exists():
+                                all_queue = load_queue(queue_path)
+                                id_set = set(str(c) for c in clip_ids)
+                                queue_items = [x for x in all_queue if isinstance(x, dict) and str(x.get("id", "")) in id_set]
+                        except Exception:
+                            queue_items = []
+
+                    uploaded_items = [
+                        x for x in queue_items
+                        if x.get("status") == "uploaded"
+                        and isinstance(x.get("youtube_video_id"), str)
+                        and re.fullmatch(r"[A-Za-z0-9_-]{11}", x["youtube_video_id"])
+                    ]
+
+                    if task.get("cancel_requested"):
+                        task["status"] = "cancelled"
+                        task["error"] = "Task was cancelled before completion; reconciled on restart."
+                    elif kind == "upload" and uploaded_items:
+                        res = {
+                            "selected": len(queue_items),
+                            "uploaded": len(uploaded_items),
+                            "failed_or_blocked": sum(x.get("status") in {"failed", "blocked"} for x in queue_items),
+                            "pending": sum(x.get("status") == "pending" for x in queue_items),
+                            "needs_review": sum(x.get("status") == "needs_review" for x in queue_items),
+                            "publications": sum(x.get("youtube_privacy_status") == "public" for x in uploaded_items),
+                            "uploaded_video_ids": [x["youtube_video_id"] for x in uploaded_items],
+                            "clip_results": [
+                                {
+                                    "id": x.get("id"),
+                                    "status": x.get("status"),
+                                    "youtube_video_id": x.get("youtube_video_id"),
+                                    "privacy": x.get("youtube_privacy_status")
+                                }
+                                for x in queue_items
+                            ]
+                        }
+                        if len(uploaded_items) == len(queue_items):
+                            task["status"] = "finalization_error"
+                            res["outcome"] = "finalization_error"
+                            task["error"] = "Upload verified in queue, but worker process exited before finalizing; reconciled on restart."
+                        else:
+                            task["status"] = "interrupted"
+                            res["outcome"] = "partial_upload"
+                            task["error"] = f"Worker interrupted after {len(uploaded_items)} of {len(queue_items)} clip(s) were uploaded; reconciled on restart."
+                        task["result"] = res
+                    elif queue_items and all(x.get("status") == "blocked" for x in queue_items):
+                        task["status"] = "blocked"
+                        task["error"] = "Upload blocked by YouTube limit or authentication; reconciled on restart."
+                    elif queue_items and any(x.get("status") == "needs_review" for x in queue_items):
+                        task["status"] = "needs_review"
+                        task["error"] = "Upload requires manual review before proceeding; reconciled on restart."
+                    else:
+                        task["status"] = "failed"
+                        task["error"] = "Worker process terminated unexpectedly; reconciled on restart."
                     task["finished_at"] = now_ts
                     changed = True
                     if _confirmation_belongs_to(state, task.get("id")):
                         state["confirmation"] = None
+                    try:
+                        from telegram_bot.progress import get_tracker
+                        tracker = get_tracker(task_id)
+                        if tracker:
+                            tracker.finish(status=task["status"].upper(), error=task.get("error"))
+                    except Exception:
+                        pass
         return changed
 
     if data is not None:
@@ -217,16 +287,66 @@ def _watch_process(task_id, process):
     code = process.wait()
     task = task_info(task_id) or {}
     if task.get("status") in {"queued", "running", "waiting_confirmation", "paused", "cancelling"}:
+        result = None
         if task.get("cancel_requested"):
             status = "cancelled"
             err = None
-        elif code != 0:
-            status = "failed"
-            err = f"Worker exited with code {code}."
         else:
-            status = "failed"
-            err = "Worker exited without recording a final task result."
-        finish(task_id, status, error=err)
+            clip_ids = list(task.get("clip_ids", []))
+            if task.get("target_clip_id") and task.get("target_clip_id") not in clip_ids:
+                clip_ids.append(task.get("target_clip_id"))
+            queue_items = []
+            if clip_ids and task.get("kind") == "upload":
+                try:
+                    from queue_manager import load_queue
+                    queue_path = Path(os.getenv("REVIEW_DIR", "review")) / "queue.json"
+                    if queue_path.exists():
+                        all_queue = load_queue(queue_path)
+                        id_set = set(str(c) for c in clip_ids)
+                        queue_items = [x for x in all_queue if isinstance(x, dict) and str(x.get("id", "")) in id_set]
+                except Exception:
+                    queue_items = []
+            uploaded_items = [
+                x for x in queue_items
+                if x.get("status") == "uploaded"
+                and isinstance(x.get("youtube_video_id"), str)
+                and re.fullmatch(r"[A-Za-z0-9_-]{11}", x["youtube_video_id"])
+            ]
+            if uploaded_items:
+                res = {
+                    "selected": len(queue_items),
+                    "uploaded": len(uploaded_items),
+                    "failed_or_blocked": sum(x.get("status") in {"failed", "blocked"} for x in queue_items),
+                    "pending": sum(x.get("status") == "pending" for x in queue_items),
+                    "needs_review": sum(x.get("status") == "needs_review" for x in queue_items),
+                    "publications": sum(x.get("youtube_privacy_status") == "public" for x in uploaded_items),
+                    "uploaded_video_ids": [x["youtube_video_id"] for x in uploaded_items],
+                    "clip_results": [
+                        {
+                            "id": x.get("id"),
+                            "status": x.get("status"),
+                            "youtube_video_id": x.get("youtube_video_id"),
+                            "privacy": x.get("youtube_privacy_status")
+                        }
+                        for x in queue_items
+                    ]
+                }
+                if len(uploaded_items) == len(queue_items):
+                    status = "finalization_error"
+                    res["outcome"] = "finalization_error"
+                    err = f"Worker exited with code {code} after upload verified; finalization encountered an error."
+                else:
+                    status = "interrupted"
+                    res["outcome"] = "partial_upload"
+                    err = f"Worker exited with code {code} after partial upload ({len(uploaded_items)} of {len(queue_items)})."
+                result = res
+            elif code != 0:
+                status = "failed"
+                err = f"Worker exited with code {code}."
+            else:
+                status = "failed"
+                err = "Worker exited without recording a final task result."
+        finish(task_id, status, error=err, result=result)
         chat_id = task.get("chat_id")
         if chat_id and not (task.get("kind") == "prepare" and status in {"completed", "failed"}):
             try:
@@ -236,6 +356,10 @@ def _watch_process(task_id, process):
                     send_telegram_to(chat_id, f"🛑 Task {task_id} ({kind}) was cancelled.")
                 elif status == "completed":
                     send_telegram_to(chat_id, f"✅ Task {task_id} ({kind}) completed successfully.")
+                elif status == "finalization_error":
+                    send_telegram_to(chat_id, f"⚠️ Task {task_id} ({kind}): Upload succeeded, but finalization encountered an error ({err or 'bookkeeping error'}). Use /task {task_id} for details.")
+                elif status == "interrupted":
+                    send_telegram_to(chat_id, f"⚠️ Task {task_id} ({kind}) was interrupted. Partial upload details preserved; use /task {task_id}.")
                 else:
                     send_telegram_to(chat_id, f"❌ Task {task_id} ({kind}) failed ({err or 'unknown error'}). Use /logs or /task {task_id} for details.")
             except Exception:
@@ -552,11 +676,25 @@ def finish(task_id, status, *, error=None, result=None):
     def apply(data):
         task = data.get("tasks", {}).get(task_id)
         if task:
+            current_status = task.get("status")
+            if current_status in {"completed", "finalization_error"}:
+                if status == "failed":
+                    if error and not task.get("error"):
+                        task["error"] = str(error)[:400]
+                    if _confirmation_belongs_to(data, task_id):
+                        data["confirmation"] = None
+                    return
             task.update(status=status, finished_at=time.time())
             if error:
                 task["error"] = str(error)[:400]
             if result is not None:
-                task["result"] = result
+                existing_result = task.get("result")
+                if isinstance(existing_result, dict) and isinstance(result, dict):
+                    merged = dict(existing_result)
+                    merged.update(result)
+                    task["result"] = merged
+                else:
+                    task["result"] = result
         if _confirmation_belongs_to(data, task_id):
             data["confirmation"] = None
     _mutate(apply)

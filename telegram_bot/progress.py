@@ -126,7 +126,7 @@ def format_progress_message(record):
         lines.append("")
 
     remaining_stages = record.get("remaining_stages", [])
-    if remaining_stages and status not in {"COMPLETED", "FAILED", "CANCELLED", "NO_ELIGIBLE_CLIPS"}:
+    if remaining_stages and status not in {"COMPLETED", "FAILED", "CANCELLED", "NO_ELIGIBLE_CLIPS", "FINALIZATION_ERROR", "INTERRUPTED"}:
         lines.append("Remaining:")
         for st in remaining_stages:
             lines.append(f"○ {st}")
@@ -443,7 +443,13 @@ class ProgressTracker:
     def finish(self, status="COMPLETED", error=None, force_telegram=True):
         """Finalize the task with terminal status."""
         with self.lock:
+            current = self.record.get("status")
             clean_status = str(status).upper()
+            if current in {"COMPLETED", "FINALIZATION_ERROR"} and clean_status == "FAILED":
+                if error and not self.record.get("error"):
+                    self.record["error"] = str(error)
+                self._persist()
+                return
             self.record["status"] = clean_status
             self.record["finished_at"] = time.time()
             self.record["updated_at"] = time.time()

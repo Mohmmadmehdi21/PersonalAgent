@@ -1510,6 +1510,16 @@ def main():
                         "needs_review": sum(x.get("status") == "needs_review" for x in associated_items),
                         "publications": sum(x.get("youtube_privacy_status") == "public"
                                             for x in uploaded_items),
+                        "uploaded_video_ids": [x["youtube_video_id"] for x in uploaded_items],
+                        "clip_results": [
+                            {
+                                "id": x.get("id"),
+                                "status": x.get("status"),
+                                "youtube_video_id": x.get("youtube_video_id"),
+                                "privacy": x.get("youtube_privacy_status")
+                            }
+                            for x in associated_items
+                        ],
                     }
                     result["outcome"] = "no_eligible_clips" if not associated_items else (
                         "uploaded" if len(uploaded_items) == len(associated_items) else "unresolved"
@@ -1549,10 +1559,53 @@ def main():
             log_warn(f"[Monitoring] Could not preserve failing stage before cleanup: {stage_error}")
         if control_task_id:
             try:
-                from telegram_bot.control import finish
-                finish(control_task_id, "failed", error=e)
+                from telegram_bot.control import finish, task_info
+                task = task_info(control_task_id) or {}
+                associated = set(task.get("clip_ids", []))
+                queue_snapshot = load_queue()
+                associated_items = [x for x in queue_snapshot
+                                    if isinstance(x, dict) and str(x.get("id", "")) in associated]
+                uploaded_items = [
+                    x for x in associated_items
+                    if x.get("status") == "uploaded"
+                    and isinstance(x.get("youtube_video_id"), str)
+                    and re.fullmatch(r"[A-Za-z0-9_-]{11}", x["youtube_video_id"])
+                ]
+                if uploaded_items:
+                    res = {
+                        "selected": len(associated_items),
+                        "uploaded": len(uploaded_items),
+                        "failed_or_blocked": sum(x.get("status") in {"failed", "blocked"} for x in associated_items),
+                        "pending": sum(x.get("status") == "pending" for x in associated_items),
+                        "needs_review": sum(x.get("status") == "needs_review" for x in associated_items),
+                        "publications": sum(x.get("youtube_privacy_status") == "public" for x in uploaded_items),
+                        "uploaded_video_ids": [x["youtube_video_id"] for x in uploaded_items],
+                        "clip_results": [
+                            {
+                                "id": x.get("id"),
+                                "status": x.get("status"),
+                                "youtube_video_id": x.get("youtube_video_id"),
+                                "privacy": x.get("youtube_privacy_status")
+                            }
+                            for x in associated_items
+                        ]
+                    }
+                    if len(uploaded_items) == len(associated_items):
+                        res["outcome"] = "finalization_error"
+                        status = "finalization_error"
+                    else:
+                        res["outcome"] = "partial_upload"
+                        status = "finalization_error"
+                    err_msg = f"Upload verified ({len(uploaded_items)} clip(s)), but secondary persistence/finalization failed: {e}"
+                    finish(control_task_id, status, error=err_msg, result=res)
+                else:
+                    finish(control_task_id, "failed", error=e)
             except Exception:
-                pass
+                try:
+                    from telegram_bot.control import finish
+                    finish(control_task_id, "failed", error=e)
+                except Exception:
+                    pass
         try:
             from telegram_bot.monitoring import finish_run
             finish_run("failed", error=e)

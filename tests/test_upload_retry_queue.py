@@ -749,6 +749,151 @@ class PreparationDiagnosticsTests(unittest.TestCase):
         self.assertEqual(task["result"]["selected"], 1)
         self.assertEqual(task["result"]["uploaded"], 0)
 
+    def test_main_preserves_verified_upload_on_secondary_persistence_failure(self):
+        main = load_main_with_stubs()
+        from telegram_bot import control, monitoring
+
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as directory:
+            control_path = Path(directory) / "telegram_control.json"
+            queue_item = {
+                "id": "clip-success", "key": "src:1", "status": "uploaded",
+                "youtube_video_id": "AbCdEfGhIjK", "youtube_privacy_status": "public"
+            }
+            main.load_queue = lambda: [queue_item]
+            def failing_render():
+                raise RuntimeError("disk write failed during secondary cleanup")
+            main.render_stage = failing_render
+
+            with patch.object(control, "CONTROL_FILE", control_path):
+                control._write({"tasks": {"task-fail-persist": {
+                    "id": "task-fail-persist", "kind": "upload", "status": "running",
+                    "owner_id": "12345", "chat_id": "12345", "clip_ids": ["clip-success"],
+                }}})
+                with patch.dict(os.environ, {"AGENT_CONTROL_TASK_ID": "task-fail-persist"}), \
+                     patch.object(main, "acquire_lock"), patch.object(main, "release_lock"), \
+                     patch.object(monitoring, "begin_run"), patch.object(monitoring, "finish_run"), \
+                     patch("telegram_bot.progress.get_tracker", return_value=None), \
+                     patch.object(main, "notify_run_error"), \
+                     patch("sys.argv", ["main.py", "render"]):
+                    with self.assertRaises(RuntimeError):
+                        main.main()
+                    task = control.task_info("task-fail-persist")
+
+        self.assertEqual(task["status"], "finalization_error")
+        self.assertEqual(task["result"]["outcome"], "finalization_error")
+        self.assertEqual(task["result"]["selected"], 1)
+        self.assertEqual(task["result"]["uploaded"], 1)
+        self.assertEqual(task["result"]["publications"], 1)
+        self.assertEqual(task["result"]["uploaded_video_ids"], ["AbCdEfGhIjK"])
+        self.assertIn("secondary persistence/finalization failed", task["error"])
+
+    def test_reconcile_tasks_preserves_verified_upload_and_is_idempotent(self):
+        from telegram_bot import control
+
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as directory:
+            control_path = Path(directory) / "telegram_control.json"
+            queue_path = Path(directory) / "queue.json"
+            queue_data = [{
+                "id": "clip-uploaded-dead", "key": "src:dead", "status": "uploaded",
+                "youtube_video_id": "XyZ12345678", "youtube_privacy_status": "public"
+            }]
+            queue_path.write_text(json.dumps(queue_data), encoding="utf-8")
+
+            state = {
+                "tasks": {
+                    "task-dead-worker": {
+                        "id": "task-dead-worker",
+                        "kind": "upload",
+                        "status": "running",
+                        "pid": 9999991,
+                        "owner_id": "12345",
+                        "clip_ids": ["clip-uploaded-dead"]
+                    }
+                },
+                "confirmation": None
+            }
+
+            with patch.object(control, "CONTROL_FILE", control_path), \
+                 patch.dict(os.environ, {"REVIEW_DIR": str(directory)}), \
+                 patch("lock.is_pid_alive", return_value=False):
+                control._write(state)
+                changed = control.reconcile_tasks(state)
+                self.assertTrue(changed)
+                task = state["tasks"]["task-dead-worker"]
+                self.assertEqual(task["status"], "finalization_error")
+                self.assertEqual(task["result"]["outcome"], "finalization_error")
+                self.assertEqual(task["result"]["uploaded_video_ids"], ["XyZ12345678"])
+                self.assertIn("Upload verified in queue", task["error"])
+
+                # Idempotency check: second run does not change terminal status
+                second_changed = control.reconcile_tasks(state)
+                self.assertFalse(second_changed)
+                self.assertEqual(state["tasks"]["task-dead-worker"]["status"], "finalization_error")
+
+    def test_reconcile_tasks_preserves_partial_upload_as_interrupted(self):
+        from telegram_bot import control
+
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as directory:
+            control_path = Path(directory) / "telegram_control.json"
+            queue_path = Path(directory) / "queue.json"
+            queue_data = [
+                {"id": "c1", "key": "k1", "status": "uploaded", "youtube_video_id": "VidOne12345", "youtube_privacy_status": "public"},
+                {"id": "c2", "key": "k2", "status": "pending", "youtube_video_id": None}
+            ]
+            queue_path.write_text(json.dumps(queue_data), encoding="utf-8")
+
+            state = {
+                "tasks": {
+                    "task-partial": {
+                        "id": "task-partial",
+                        "kind": "upload",
+                        "status": "running",
+                        "pid": 9999992,
+                        "owner_id": "12345",
+                        "clip_ids": ["c1", "c2"]
+                    }
+                }
+            }
+
+            with patch.object(control, "CONTROL_FILE", control_path), \
+                 patch.dict(os.environ, {"REVIEW_DIR": str(directory)}), \
+                 patch("lock.is_pid_alive", return_value=False):
+                control._write(state)
+                changed = control.reconcile_tasks(state)
+                self.assertTrue(changed)
+                task = state["tasks"]["task-partial"]
+                self.assertEqual(task["status"], "interrupted")
+                self.assertEqual(task["result"]["outcome"], "partial_upload")
+                self.assertEqual(task["result"]["uploaded"], 1)
+                self.assertEqual(task["result"]["uploaded_video_ids"], ["VidOne12345"])
+
+    def test_finish_protects_authoritative_terminal_state_against_late_downgrade(self):
+        from telegram_bot import control
+
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as directory:
+            control_path = Path(directory) / "telegram_control.json"
+            state = {
+                "tasks": {
+                    "task-completed": {
+                        "id": "task-completed",
+                        "kind": "upload",
+                        "status": "completed",
+                        "result": {
+                            "outcome": "uploaded",
+                            "uploaded_video_ids": ["VidDone1234"]
+                        }
+                    }
+                }
+            }
+            with patch.object(control, "CONTROL_FILE", control_path):
+                control._write(state)
+                # Late callback tries to mark the task as failed
+                control.finish("task-completed", "failed", error="late exit failure")
+                saved = control.task_info("task-completed")
+                self.assertEqual(saved["status"], "completed")
+                self.assertEqual(saved["result"]["uploaded_video_ids"], ["VidDone1234"])
+                self.assertEqual(saved["error"], "late exit failure")
+
 
 if __name__ == "__main__":
     unittest.main()
