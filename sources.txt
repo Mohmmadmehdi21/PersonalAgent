@@ -5,11 +5,6 @@
 https://www.youtube.com/@MrBeast
 https://www.youtube.com/channel/UCX6OQ3DkcsbYNE6H8uQQuVA
 # --- added 2026-10-18 17:00:04 UTC by merge_sources.py: MrBeast official channel, 15+ min, sorted by views ---
-https://www.youtube.com/watch?v=0e3GPea1Tyg | MrBeast official, 15+ min
-https://www.youtube.com/watch?v=KrLj6nc516A | MrBeast official, 15+ min
-https://www.youtube.com/watch?v=zxYjTTXc-J8 | MrBeast official, 15+ min
-https://www.youtube.com/watch?v=tnTPaLOaHz8 | MrBeast official, 15+ min
-https://www.youtube.com/watch?v=erLbbextvlY | MrBeast official, 15+ min
 https://www.youtube.com/watch?v=4SNThp0YiU4 | MrBeast official, 15+ min
 https://www.youtube.com/watch?v=9RhWXPcKBI8 | MrBeast official, 15+ min
 https://www.youtube.com/watch?v=iogcY_4xGjo | MrBeast official, 15+ min

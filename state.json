@@ -1,5 +1,314 @@
 {
-  "done": [],
-  "clips": [],
-  "done_videos": []
+  "done": [
+    "https://www.youtube.com/watch?v=0e3GPea1Tyg",
+    "https://www.youtube.com/watch?v=KrLj6nc516A",
+    "https://www.youtube.com/watch?v=zxYjTTXc-J8",
+    "https://www.youtube.com/watch?v=tnTPaLOaHz8",
+    "https://www.youtube.com/watch?v=erLbbextvlY",
+    "https://www.youtube.com/watch?v=4SNThp0YiU4"
+  ],
+  "clips": [
+    "erLbbextvlY:811-846",
+    "erLbbextvlY:927-963",
+    "4SNThp0YiU4:2145-2181",
+    "9RhWXPcKBI8:802-838"
+  ],
+  "done_videos": [
+    "0e3GPea1Tyg",
+    "KrLj6nc516A",
+    "zxYjTTXc-J8",
+    "tnTPaLOaHz8",
+    "erLbbextvlY",
+    "4SNThp0YiU4"
+  ],
+  "videos": {
+    "erLbbextvlY": {
+      "source_id": "erLbbextvlY",
+      "source_url": "https://www.youtube.com/watch?v=erLbbextvlY",
+      "source_title": "",
+      "permission_note": "MrBeast official, 15+ min",
+      "status": "failed",
+      "attempts": 0,
+      "error": "Step 'transcribe' failed: open() got an unexpected keyword argument 'metadata_errors'",
+      "created_at": "2026-10-20 00:59:50",
+      "updated_at": "2026-10-20 01:50:08",
+      "steps": {
+        "download": {
+          "status": "done",
+          "file": "work/erLbbextvlY.mp4",
+          "error": null,
+          "attempts": 3,
+          "updated_at": "2026-10-20 01:45:04"
+        },
+        "transcribe": {
+          "status": "done",
+          "file": "work/erLbbextvlY.transcript.json",
+          "error": "open() got an unexpected keyword argument 'metadata_errors'",
+          "attempts": 3,
+          "updated_at": "2026-10-20 01:50:08"
+        },
+        "find_clips": {
+          "status": "done",
+          "file": "work/erLbbextvlY.clips.json",
+          "error": null,
+          "attempts": 1,
+          "updated_at": "2026-10-20 01:50:08"
+        }
+      },
+      "clips": {
+        "erLbbextvlY:811-846": {
+          "key": "erLbbextvlY:811-846",
+          "id": "erLbbextvlY_0",
+          "title": "This Completely Changed Everything! 💥",
+          "template": "BREAKDOWN",
+          "start": 811.26,
+          "end": 846.86,
+          "hook_score": 9,
+          "status": "uploaded",
+          "cut": {
+            "status": "done",
+            "file": "work/erLbbextvlY_0.mp4",
+            "error": "Public upload requires owner confirmation through the Telegram bot.",
+            "updated_at": "2026-10-20 02:18:16"
+          },
+          "thumbnail": {
+            "status": "done",
+            "file": "work/erLbbextvlY_0.jpg",
+            "error": null,
+            "updated_at": "2026-10-20 02:18:16"
+          },
+          "upload": {
+            "status": "done",
+            "youtube_video_id": "aE8N-2nc7KA",
+            "error": null,
+            "updated_at": "2026-10-20 02:18:40"
+          },
+          "error": "Clip step 'cut' failed: Public upload requires owner confirmation through the Telegram bot.",
+          "youtube_video_id": "aE8N-2nc7KA"
+        },
+        "erLbbextvlY:927-963": {
+          "key": "erLbbextvlY:927-963",
+          "id": "erLbbextvlY_1",
+          "title": "Pay Close Attention Here! ⚡",
+          "template": "INTRO_PLUS_BREAKDOWN",
+          "start": 927.84,
+          "end": 963.72,
+          "hook_score": 9,
+          "status": "uploaded",
+          "cut": {
+            "status": "done",
+            "file": "work/erLbbextvlY_1.mp4",
+            "error": "Public upload requires owner confirmation through the Telegram bot.",
+            "updated_at": "2026-10-20 02:18:40"
+          },
+          "thumbnail": {
+            "status": "done",
+            "file": "work/erLbbextvlY_1.jpg",
+            "error": null,
+            "updated_at": "2026-10-20 02:18:40"
+          },
+          "upload": {
+            "status": "done",
+            "youtube_video_id": "aUProZKQPao",
+            "error": null,
+            "updated_at": "2026-10-20 02:18:57"
+          },
+          "error": "Clip step 'cut' failed: Public upload requires owner confirmation through the Telegram bot.",
+          "youtube_video_id": "aUProZKQPao"
+        }
+      },
+      "clip_candidates": []
+    },
+    "4SNThp0YiU4": {
+      "source_id": "4SNThp0YiU4",
+      "source_url": "https://www.youtube.com/watch?v=4SNThp0YiU4",
+      "source_title": "",
+      "permission_note": "MrBeast official, 15+ min",
+      "status": "pending",
+      "attempts": 0,
+      "error": null,
+      "created_at": "2026-10-20 02:45:48",
+      "updated_at": "2026-10-20 02:56:19",
+      "steps": {
+        "download": {
+          "status": "done",
+          "file": "work/4SNThp0YiU4.mp4",
+          "error": null,
+          "attempts": 1,
+          "updated_at": "2026-10-20 02:46:46"
+        },
+        "transcribe": {
+          "status": "done",
+          "file": "work/4SNThp0YiU4.transcript.json",
+          "error": null,
+          "attempts": 1,
+          "updated_at": "2026-10-20 02:56:19"
+        },
+        "find_clips": {
+          "status": "done",
+          "file": "work/4SNThp0YiU4.clips.json",
+          "error": null,
+          "attempts": 1,
+          "updated_at": "2026-10-20 02:56:19"
+        }
+      },
+      "clips": {
+        "4SNThp0YiU4:2145-2181": {
+          "key": "4SNThp0YiU4:2145-2181",
+          "id": "4SNThp0YiU4_2145_2181",
+          "title": "The Most Crucial Moment 🤯",
+          "template": "INTRO_PLUS_BREAKDOWN",
+          "start": 2145.32,
+          "end": 2181.84,
+          "hook_score": 9,
+          "status": "uploaded",
+          "cut": {
+            "status": "done",
+            "file": "work/4SNThp0YiU4_2145_2181.mp4",
+            "error": null,
+            "updated_at": "2026-10-20 03:01:11"
+          },
+          "thumbnail": {
+            "status": "done",
+            "file": "work/4SNThp0YiU4_2145_2181.jpg",
+            "error": null,
+            "updated_at": "2026-10-20 03:01:11"
+          },
+          "upload": {
+            "status": "done",
+            "youtube_video_id": "6CtAMlcadsA",
+            "error": null,
+            "updated_at": "2026-10-20 03:01:33"
+          },
+          "youtube_video_id": "6CtAMlcadsA"
+        },
+        "4SNThp0YiU4:2239-2275": {
+          "key": "4SNThp0YiU4:2239-2275",
+          "id": "4SNThp0YiU4_2239_2275",
+          "title": "So it's a tie.. 🔥",
+          "template": "BREAKDOWN",
+          "start": 2239.07,
+          "end": 2275.77,
+          "hook_score": 9,
+          "status": "rendered",
+          "cut": {
+            "status": "done",
+            "file": "work/4SNThp0YiU4_2239_2275.mp4",
+            "error": null,
+            "updated_at": "2026-10-20 03:02:09"
+          },
+          "thumbnail": {
+            "status": "done",
+            "file": "work/4SNThp0YiU4_2239_2275.jpg",
+            "error": null,
+            "updated_at": "2026-10-20 03:02:09"
+          },
+          "upload": {
+            "status": "blocked",
+            "youtube_video_id": null,
+            "error": "uploadLimitExceeded",
+            "updated_at": "2026-10-20 03:02:14"
+          }
+        }
+      },
+      "clip_candidates": []
+    },
+    "9RhWXPcKBI8": {
+      "source_id": "9RhWXPcKBI8",
+      "source_url": "https://www.youtube.com/watch?v=9RhWXPcKBI8",
+      "source_title": "",
+      "permission_note": "MrBeast official, 15+ min",
+      "status": "failed",
+      "attempts": 0,
+      "error": "Step 'find_clips' failed: state.json could not be saved atomically; the previous file was preserved.",
+      "created_at": "2026-10-20 04:41:58",
+      "updated_at": "2026-10-21 02:13:50",
+      "steps": {
+        "download": {
+          "status": "done",
+          "file": "work/9RhWXPcKBI8.mp4",
+          "error": null,
+          "attempts": 7,
+          "updated_at": "2026-10-21 02:13:46"
+        },
+        "transcribe": {
+          "status": "done",
+          "file": "work/9RhWXPcKBI8.transcript.json",
+          "error": null,
+          "attempts": 7,
+          "updated_at": "2026-10-21 02:13:48"
+        },
+        "find_clips": {
+          "status": "done",
+          "file": "work/9RhWXPcKBI8.clips.json",
+          "error": "state.json could not be saved atomically; the previous file was preserved.",
+          "attempts": 8,
+          "updated_at": "2026-10-21 02:13:50"
+        }
+      },
+      "clips": {
+        "9RhWXPcKBI8:802-838": {
+          "key": "9RhWXPcKBI8:802-838",
+          "id": "9RhWXPcKBI8_802_838",
+          "title": "This Completely Changed Everything! 💥",
+          "template": "INTRO_CARD",
+          "start": 802.44,
+          "end": 838.94,
+          "hook_score": 9,
+          "status": "uploaded",
+          "cut": {
+            "status": "done",
+            "file": "work/9RhWXPcKBI8_802_838.mp4",
+            "error": null,
+            "updated_at": "2026-10-21 02:14:49"
+          },
+          "thumbnail": {
+            "status": "done",
+            "file": "work/9RhWXPcKBI8_802_838.jpg",
+            "error": null,
+            "updated_at": "2026-10-21 02:14:49"
+          },
+          "upload": {
+            "status": "done",
+            "youtube_video_id": "jWhkFq5bDJQ",
+            "error": "uploadLimitExceeded",
+            "updated_at": "2026-10-21 02:15:19"
+          },
+          "youtube_video_id": "jWhkFq5bDJQ"
+        },
+        "9RhWXPcKBI8:1031-1066": {
+          "key": "9RhWXPcKBI8:1031-1066",
+          "id": "9RhWXPcKBI8_1031_1066",
+          "title": "Wait For The Reaction! 👀",
+          "template": "BREAKDOWN",
+          "start": 1031.09,
+          "end": 1066.59,
+          "hook_score": 9,
+          "status": "rendered",
+          "cut": {
+            "status": "done",
+            "file": "work/9RhWXPcKBI8_1031_1066.mp4",
+            "error": null,
+            "updated_at": "2026-10-20 14:09:17"
+          },
+          "thumbnail": {
+            "status": "done",
+            "file": "work/9RhWXPcKBI8_1031_1066.jpg",
+            "error": null,
+            "updated_at": "2026-10-20 14:09:17"
+          },
+          "upload": {
+            "status": "blocked",
+            "youtube_video_id": null,
+            "error": "uploadLimitExceeded",
+            "updated_at": "2026-10-20 14:10:42"
+          }
+        }
+      },
+      "clip_candidates": []
+    }
+  },
+  "failed_video_ids": [
+    "erLbbextvlY"
+  ]
 }
