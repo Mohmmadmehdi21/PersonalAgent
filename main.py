@@ -111,8 +111,36 @@ from render_cache import cache_matches, write_cache
 
 QUEUE_FILE = os.path.join(REVIEW_DIR, "queue.json").replace("\\", "/")
 
-def _monitor_progress(stage, task, *, message=None):
+def _monitor_progress(stage, task, *, message=None, progress_frac=None, detail=None):
     log_event("pipeline_progress", stage=stage, task=task)
+    task_id = os.getenv("AGENT_CONTROL_TASK_ID", "").strip()
+    if task_id:
+        try:
+            from telegram_bot.progress import get_tracker
+            tracker = get_tracker(task_id)
+            if tracker:
+                prepare_map = {
+                    "select source": ("source_validation", "Validating sources and candidates"),
+                    "download source": ("download", "Downloading source video"),
+                    "transcribe source": ("transcribe", "Extracting audio and generating transcript"),
+                    "analyze transcript": ("ai_analysis", "AI analyzing transcript & drafting commentary"),
+                    "assess clips": ("clip_selection", "Evaluating clip quality and rights compliance"),
+                    "drafts queued": ("queue_insertion", "Saving clips to review queue"),
+                }
+                if stage == "prepare" and task in prepare_map:
+                    sid, default_det = prepare_map[task]
+                    if sid == "queue_insertion":
+                        tracker.complete_stage("clip_selection", force_telegram=False)
+                        tracker.start_stage("queue_insertion", detail=detail or message or default_det, force_telegram=False)
+                        tracker.complete_stage("queue_insertion", detail=detail or message or default_det, force_telegram=True)
+                    else:
+                        tracker.start_stage(sid, detail=detail or message or default_det)
+                elif stage == "render" and task == "load pending queue":
+                    tracker.start_stage("queue_assessment", detail="Assessing pending clips")
+                elif progress_frac is not None or detail is not None or message is not None:
+                    tracker.update_stage(progress=progress_frac, detail=detail or message)
+        except Exception:
+            pass
     if message and os.getenv("TELEGRAM_PROGRESS_ENABLED", "false").strip().lower() in ("true", "1", "t", "yes"):
         try:
             from notify import send_telegram_to
@@ -490,6 +518,15 @@ def prepare_stage(source_fallbacks=0):
             log_event("task_result", task="prepare:download", status="success", video_id=video_id)
             print(f"[Timing] Download check took {time.time() - t0:.1f}s")
             log(f"[Prepare] Video ready ({video_id}): {src}")
+            task_id = os.getenv("AGENT_CONTROL_TASK_ID", "").strip()
+            if task_id:
+                try:
+                    from telegram_bot.progress import get_tracker
+                    _tr = get_tracker(task_id)
+                    if _tr:
+                        _tr.complete_stage("download", detail=f"Downloaded {info.get('title', cand_vid)[:40]}")
+                except Exception:
+                    pass
             break
         except PermanentSourceError as pse:
             last_download_error = pse
@@ -588,8 +625,16 @@ def prepare_stage(source_fallbacks=0):
         update_step_status(state, video_id, "transcribe", "done", file_path=transcript_cache)
         log_event("task_result", task="prepare:transcribe", status="success",
                   video_id=video_id, segment_count=len(transcript))
-        print(f"[Timing] Transcription step took {time.time() - t0:.1f}s")
         log(f"[Prepare] Transcription complete: {len(transcript)} segments")
+        task_id = os.getenv("AGENT_CONTROL_TASK_ID", "").strip()
+        if task_id:
+            try:
+                from telegram_bot.progress import get_tracker
+                _tr = get_tracker(task_id)
+                if _tr:
+                    _tr.complete_stage("transcribe", detail=f"{len(transcript)} audio segments transcribed")
+            except Exception:
+                pass
     except Exception as e:
         log_error(f"[Prepare] Transcription failed: {e}")
         log_event("task_result", task="prepare:transcribe", status="failure",
@@ -629,6 +674,15 @@ def prepare_stage(source_fallbacks=0):
                   video_id=video_id, candidate_count=len(clips))
         print(f"[Timing] {len(clips)} viral clips identified ({time.time() - t0:.1f}s)")
         log(f"[Prepare] Clips drafted: {len(clips)} clips")
+        task_id = os.getenv("AGENT_CONTROL_TASK_ID", "").strip()
+        if task_id:
+            try:
+                from telegram_bot.progress import get_tracker
+                _tr = get_tracker(task_id)
+                if _tr:
+                    _tr.complete_stage("ai_analysis", detail=f"{len(clips)} viral clips identified")
+            except Exception:
+                pass
     except FatalError as fe:
         log_error(f"[Prepare] Fatal Groq error: {fe}")
         update_step_status(state, video_id, "find_clips", "failed", error=str(fe))
@@ -658,6 +712,7 @@ def prepare_stage(source_fallbacks=0):
         if os.getenv("AGENT_CONTROL_TASK_ID"):
             log_warn(f"[Telegram Control] Checkpoint failed safely: {control_error}")
 
+    _monitor_progress("prepare", "assess clips", message="Assessing clip quality and rights compliance...")
     try:
         clips = guard.filter_clips(info["id"], clips)
     except Exception as e:
@@ -735,6 +790,16 @@ def prepare_stage(source_fallbacks=0):
             return prepare_stage(source_fallbacks + 1)
         print("[Prepare] Is run mein 5 source videos check ho chuke; agle run mein phir continue hoga.")
         return
+
+    task_id = os.getenv("AGENT_CONTROL_TASK_ID", "").strip()
+    if task_id:
+        try:
+            from telegram_bot.progress import get_tracker
+            _tr = get_tracker(task_id)
+            if _tr:
+                _tr.complete_stage("clip_selection", detail=f"{len(clips)} validated clips selected")
+        except Exception:
+            pass
 
     # Add drafted clips into queue & state
     new_drafts = 0
@@ -818,12 +883,26 @@ def render_stage():
     queue = load_queue()
     _monitor_progress("render", "load pending queue")
 
+    target_clip_id = os.getenv("AGENT_CONTROL_CLIP_ID", "").strip()
     clips_to_process = [
         item for item in queue
         if item.get("status") in ("pending", None)
+        and (not target_clip_id or str(item.get("id", "")) == target_clip_id)
     ]
     if not clips_to_process:
         print("\n[Render] Koi pending clips process karne ke liye nahi hain.\n")
+        task_id = os.getenv("AGENT_CONTROL_TASK_ID", "").strip()
+        if task_id:
+            try:
+                from telegram_bot.progress import get_tracker
+                tracker = get_tracker(task_id)
+                if tracker:
+                    tracker.complete_stage(
+                        "queue_assessment",
+                        detail="No eligible clips; no confirmation was requested and no upload was attempted.",
+                    )
+            except Exception as progress_error:
+                log_warn(f"[Progress] Could not record empty upload queue: {progress_error}")
         return
 
     control_task_id = os.getenv("AGENT_CONTROL_TASK_ID", "").strip()
@@ -832,7 +911,9 @@ def render_stage():
         log_error(f"[Render] {message}")
         log_event("task_result", task="render_stage", status="failure",
                   error_category="approval_required", error=message)
-        return
+        # A normal return would make main() finalize this run as successful even
+        # though the live upload was rejected before confirmation or API access.
+        raise UploadApprovalRequiredError(message)
     if control_task_id:
         try:
             from telegram_bot.control import associate_clips
@@ -850,16 +931,19 @@ def render_stage():
         print("\n[Main] DRY_RUN=True hai. Upload skip ho raha hai. Sirf enhanced clips aur thumbnails banenge.\n")
     else:
         print("\n[Main] YouTube par direct public upload shuru ho raha hai...\n")
+        _monitor_progress("render", "initialize YouTube service",
+                          detail="Checking YouTube upload service before clip processing")
         try:
             yt = get_service()
         except AuthError as ae:
             log_error(f"[Render] Auth error: {ae}")
-            notify_quota_or_auth("YouTube Authentication Failed", str(ae))
-            return
+            # Let main() persist the failed task/run and send one failure report.
+            # Returning here used to turn an auth failure into a normal worker exit.
+            raise
         except Exception as e:
             log_error(f"[Render] YouTube service initialization error: {e}")
-            notify_quota_or_auth("YouTube Service Error", str(e))
-            return
+            # Preserve the original exception and traceback for task diagnostics.
+            raise
 
     rendered_files = []
     succeeded_clips = []
@@ -867,6 +951,19 @@ def render_stage():
     failed_clips = []
     batch_stopped_reason = None
     t_stage_start = time.time()
+
+    task_id = os.getenv("AGENT_CONTROL_TASK_ID", "").strip()
+    render_tracker = None
+    if task_id:
+        try:
+            from telegram_bot.progress import get_tracker
+            render_tracker = get_tracker(task_id)
+            if render_tracker:
+                render_tracker.complete_stage("queue_assessment", detail=f"{len(clips_to_process)} clips queued")
+                render_tracker.start_stage("batch_processing", detail=f"0/{len(clips_to_process)} clips processed")
+                render_tracker.update_batch_items(processed=0, total=len(clips_to_process))
+        except Exception:
+            pass
 
     for i, item in enumerate(clips_to_process):
         if control_task_id:
@@ -887,6 +984,14 @@ def render_stage():
         key = item["key"]
         video_id = item.get("source_id", "source")
         _monitor_progress("render", f"clip {item.get('id', key)}")
+        if render_tracker:
+            render_tracker.update_batch_items(
+                processed=i,
+                total=len(clips_to_process),
+                current_title=item.get("title", f"Clip {i+1}"),
+                current_progress=10,
+                detail=f"Rendering clip {i+1}/{len(clips_to_process)}: {item.get('title', '')[:30]}",
+            )
         print("-" * 65)
         print(f"Processing Clip [{i+1}/{len(clips_to_process)}]: '{item['title']}'")
         print(f"Template: {item.get('template')} | Hook Score: {item.get('hook_score')}/10")
@@ -944,6 +1049,15 @@ def render_stage():
                 rendered_files.extend([final_clip, thumb_file])
                 print(f"[Render] Completed in {time.time() - t_render:.1f}s -> {final_clip}")
 
+            if render_tracker:
+                render_tracker.update_batch_items(
+                    processed=i,
+                    total=len(clips_to_process),
+                    current_title=item.get("title", f"Clip {i+1}"),
+                    current_progress=50,
+                    detail=f"Render complete for clip {i+1}/{len(clips_to_process)}",
+                )
+
             log_event("clip_render", task=f"clip:{item.get('id', key)}", status="success",
                       cache_reused=cache_hit, processing_seconds=round(time.time() - t_render, 3),
                       source_id=video_id, analysis_status=item.get("analysis_status"),
@@ -965,6 +1079,14 @@ def render_stage():
                 item.pop("processing_step", None)
                 item.pop("processing_started_at", None)
                 succeeded_clips.append(item)
+                if render_tracker:
+                    render_tracker.update_batch_items(
+                        processed=i + 1,
+                        total=len(clips_to_process),
+                        current_title=item.get("title", f"Clip {i+1}"),
+                        current_progress=100,
+                        detail=f"Dry run complete for clip {i+1}/{len(clips_to_process)}",
+                    )
                 log_event("task_result", task=f"clip:{item.get('id', key)}", status="success", mode="dry_run")
                 try:
                     guard.record_clip(item.get("source_id"), item.get("start"), item.get("end"), uploaded=False, dry_run=DRY_RUN)
@@ -1029,7 +1151,24 @@ def render_stage():
                 _monitor_progress("render", f"clip {item.get('id', key)} uploaded",
                                   message=f"Clip upload confirmed: {item.get('title', item.get('id', key))}.")
                 log(f"[Uploaded] Clip uploaded successfully: {vid} ({item['title']})")
+                try:
+                    from upload_availability import record_upload_success
+                    record_upload_success(
+                        clip_id=item.get("id", key),
+                        youtube_video_id=str(vid),
+                        title=item.get("title", ""),
+                    )
+                except Exception as avail_err:
+                    log_warn(f"[Upload Availability] Could not record upload success: {avail_err}")
                 succeeded_clips.append(item)
+                if render_tracker:
+                    render_tracker.update_batch_items(
+                        processed=i + 1,
+                        total=len(clips_to_process),
+                        current_title=item.get("title", f"Clip {i+1}"),
+                        current_progress=100,
+                        detail=f"Uploaded clip {i+1}/{len(clips_to_process)}",
+                    )
                 log_event("task_result", task=f"clip:{item.get('id', key)}", status="success",
                           youtube_video_id=str(vid), privacy_status=item["youtube_privacy_status"])
 
@@ -1089,6 +1228,16 @@ def render_stage():
             item["upload_error_details"] = api_details
             update_clip_step(state, video_id, key, "upload", "blocked", error=reason)
             save_queue(queue)
+            try:
+                from upload_availability import record_upload_limit_exceeded
+                record_upload_limit_exceeded(
+                    limit_error,
+                    clip_id=item.get("id", key),
+                    clip_title=item.get("title", key),
+                    details=api_details,
+                )
+            except Exception as avail_err:
+                log_warn(f"[Upload Availability] Could not record upload limit: {avail_err}")
             failed_clips.append({"title": item.get("title", item.get("id", key)), "error": reason})
             limit_msg = "[Quota Limit] Aaj ki upload limit poori ho chuki hai. Clips local 'work/' folder mein saved hain."
             print(f"\n{limit_msg}\n")
@@ -1215,6 +1364,10 @@ def render_stage():
 
     save_queue(queue)
     save_state_atomic(state)
+    if render_tracker:
+        render_tracker.complete_stage("batch_processing", detail=f"{len(succeeded_clips)} succeeded, {len(failed_clips)} failed")
+        render_tracker.start_stage("batch_finalization", detail="Finalizing batch state and cleanup")
+        render_tracker.complete_stage("batch_finalization")
 
     freed_str = None
     if not DRY_RUN:
@@ -1342,28 +1495,44 @@ def main():
                     result = {"verified_draft_count": len(verified),
                               "clip_ids": [str(item["id"]) for item in verified]}
                 elif task.get("kind") == "upload":
+                    uploaded_items = [
+                        x for x in associated_items
+                        if x.get("status") == "uploaded"
+                        and isinstance(x.get("youtube_video_id"), str)
+                        and re.fullmatch(r"[A-Za-z0-9_-]{11}", x["youtube_video_id"])
+                    ]
                     result = {
                         "selected": len(associated_items),
-                        "uploaded": sum(x.get("status") == "uploaded" and bool(x.get("youtube_video_id"))
-                                         for x in associated_items),
+                        "uploaded": len(uploaded_items),
                         "failed_or_blocked": sum(x.get("status") in {"failed", "blocked"}
                                                   for x in associated_items),
                         "pending": sum(x.get("status") == "pending" for x in associated_items),
                         "needs_review": sum(x.get("status") == "needs_review" for x in associated_items),
                         "publications": sum(x.get("youtube_privacy_status") == "public"
-                                            for x in associated_items),
+                                            for x in uploaded_items),
                     }
+                    result["outcome"] = "no_eligible_clips" if not associated_items else (
+                        "uploaded" if len(uploaded_items) == len(associated_items) else "unresolved"
+                    )
                 if task.get("cancel_requested"):
                     status = "cancelled"
                 elif task.get("kind") == "prepare":
                     # Review state belongs to each queue item; preparation itself can finish
                     # successfully while its drafts remain pending human review.
                     status = "failed" if any(state in {"failed", "blocked"} for state in clip_states) else "completed"
+                elif not associated_items:
+                    # Queue assessment completed, but this task performed no work.
+                    # This is terminal yet distinct from a successful upload.
+                    status = "no_eligible_clips"
                 elif "blocked" in clip_states:
                     status = "blocked"
                 elif "needs_review" in clip_states:
                     status = "needs_review"
                 elif "failed" in clip_states:
+                    status = "failed"
+                elif task.get("kind") == "upload" and result and result.get("uploaded", 0) != result.get("selected", 0):
+                    # A worker that selected clips but left them pending/processing
+                    # did not complete an upload, even if it exited with code zero.
                     status = "failed"
                 else:
                     status = "completed"

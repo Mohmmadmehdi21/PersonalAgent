@@ -60,6 +60,10 @@ class FakeReasonError(Exception):
 
 
 class YouTubeReportTests(unittest.TestCase):
+    def setUp(self):
+        from telegram_bot import lifecycle
+        lifecycle.set_state(lifecycle.STATE_RUNNING)
+
     def test_video_metrics_use_data_api_values(self):
         yt = FakeYouTube(videos={"items": [{"id": "abcdefghijk", "snippet": {"title": "Real title"},
                                             "statistics": {"viewCount": "1200", "likeCount": "31", "commentCount": "7"}}]})

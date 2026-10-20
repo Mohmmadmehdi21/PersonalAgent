@@ -2,6 +2,8 @@ import os, json, time, subprocess, shutil, glob, tempfile
 from logger import log, log_warn, log_error
 
 STATE_FILE = "state.json"
+STATE_REPLACE_RETRIES = 4
+STATE_REPLACE_RETRY_DELAY_SECONDS = 0.1
 
 def get_binary(name):
     """Find an executable without importing the commentary/TTS module."""
@@ -77,15 +79,32 @@ def save_state_atomic(state):
     target = os.path.abspath(STATE_FILE)
     parent = os.path.dirname(target) or "."
     fd, tmp_file = tempfile.mkstemp(prefix=".state-", suffix=".tmp", dir=parent)
+    stage = "opening temporary state file"
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
+            stage = "serializing state"
             json.dump(state, f, indent=2, ensure_ascii=False)
+            stage = "flushing state to disk"
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp_file, target)
+        stage = "replacing state file"
+        # On Windows, antivirus/indexing tools or another short-lived reader can
+        # temporarily hold the destination open. Retry only that transient replace
+        # failure; never fall back to writing the destination in place.
+        for attempt in range(STATE_REPLACE_RETRIES + 1):
+            try:
+                os.replace(tmp_file, target)
+                break
+            except PermissionError:
+                if attempt >= STATE_REPLACE_RETRIES:
+                    raise
+                time.sleep(STATE_REPLACE_RETRY_DELAY_SECONDS * (attempt + 1))
     except Exception as e:
-        log_error(f"[State] Atomic state save error: {e}")
-        raise RuntimeError("state.json could not be saved atomically; the previous file was preserved.") from e
+        log_error(f"[State] Atomic state save failed while {stage}: {type(e).__name__}: {e}")
+        raise RuntimeError(
+            f"state.json could not be saved atomically while {stage} ({type(e).__name__}); "
+            "the previous file was preserved."
+        ) from e
     finally:
         if os.path.exists(tmp_file):
             try:

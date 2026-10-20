@@ -40,6 +40,11 @@ def callback_update(user_id=12345, data="/confirm abc12345", chat_type="private"
 
 
 class TelegramAccessTests(unittest.TestCase):
+    def setUp(self):
+        os.environ["BOT_AUTO_START"] = "true"
+        from telegram_bot import lifecycle
+        lifecycle.set_state(lifecycle.STATE_RUNNING)
+
     def test_single_valid_owner_id(self):
         self.assertEqual(parse_owner_ids("123456789"), frozenset({123456789}))
         self.assertEqual(parse_owner_ids(123456789), frozenset({123456789}))
@@ -164,7 +169,8 @@ class TelegramAccessTests(unittest.TestCase):
         self.assertEqual(set(COMMAND_NAMES), {"start", "help", "commands", "status", "health", "queue", "logs", "task", "history",
                                               "showanalytics", "showviews", "showlikes", "showcomments", "videos",
                                               "review",
-                                              "prepare", "upload", "pause", "resume", "cancel", "retry", "confirm", "deny"})
+                                              "prepare", "upload", "pause", "resume", "cancel", "retry", "confirm", "deny",
+                                              "sources", "sourcemanager"})
         self.assertIn("/health", handle_update(update(text="/commands@agent"), {12345})[1])
         self.assertEqual(handle_update(update(text="/missing"), {12345})[1], "Unknown command. Use /help.")
         self.assertEqual(handle_update(update(text="/status extra"), {12345})[1], "This command takes no arguments. Use /help.")
@@ -195,7 +201,7 @@ class TelegramAccessTests(unittest.TestCase):
         self.assertIn("monitoring", authorized[1])
         callbacks = [button["callback_data"] for row in authorized[2]["inline_keyboard"] for button in row]
         self.assertEqual(set(callbacks), {"pa1:status", "pa1:queue:0", "pa1:health", "pa1:review:0",
-                                          "pa1:help", "pa2:prepare"})
+                                          "pa1:help", "pa2:prepare", "src:menu", "life:stop_prompt", "life:exit_prompt"})
         self.assertFalse(any("upload" in value for value in callbacks))
         self.assertIsNone(handle_update(update(user_id=99999, text="/start"), {12345}))
 
@@ -508,6 +514,8 @@ class TelegramAccessTests(unittest.TestCase):
 
 class TelegramPipelineControlTests(unittest.TestCase):
     def setUp(self):
+        from telegram_bot import lifecycle
+        lifecycle.set_state(lifecycle.STATE_RUNNING)
         self.tmp_dir = tempfile.TemporaryDirectory(dir="tests")
         self.task_state_path = Path(self.tmp_dir.name) / "tasks.json"
         self.patch_state = patch("telegram_bot.control.CONTROL_FILE", self.task_state_path)

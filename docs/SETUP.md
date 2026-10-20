@@ -40,16 +40,115 @@ The project/API and model names can be checked locally for presence and basic fi
 Live `run`/`render` validates that an OAuth token or OAuth client file exists when `DRY_RUN=false`. Channel URLs in `sources.txt` also need OAuth for YouTube Data API discovery; direct video URLs do not.
 
 ## Notification setup
+ 
+ - BotFather se Telegram bot token lein aur bot ko chat mein start karein; channel enable karne par `TELEGRAM_CHAT_ID` bhi set karein.
+ - Control commands ke liye `TELEGRAM_OWNER_IDS` mein apna numeric Telegram user ID comma-separated set karein, phir `python main.py telegram-bot` chalayein. Bot sirf private chat mein `/start`, `/help`, `/commands`, `/status`, `/health`, aur `/sources` accept karta hai. `TELEGRAM_OWNER_IDS` khaali ya invalid ho to polling start nahi hoti; unknown commands koi shell/code execute nahi karte. Ek local lock duplicate polling rokti hai; Telegram ka 409 conflict aane par bot band ho jata hai.
+ - Monitoring ke liye `/status`, `/health`, `/queue`, `/logs`, `/task TASK_ID`, aur `/history` use karein. `/health` credentials/configuration ki maujoodgi aur saved task outcomes dikhata hai; ye provider API ko live probe nahi karta aur heartbeat akela end-to-end success ka proof nahi hai. Major stage/confirmed upload progress messages optional hain: `.env` mein `TELEGRAM_PROGRESS_ENABLED=true` karke enable karein; ye `TELEGRAM_CHAT_ID` par jaate hain.
+ - Read-only reporting ke liye `/showanalytics 7d`, `/showanalytics 28d`, `/showviews VIDEO_ID`, `/showlikes VIDEO_ID`, `/showcomments VIDEO_ID`, aur `/videos` commands use karein. Analytics windows Pacific dates ke last complete 7/28 din use karte hain; YouTube latest metrics ko delay/omit kar sakta hai. `/videos` uploads playlist ko paginate karke 20 recent items tak list karta hai. Response cache nahi hai; har command live read request karti hai. OAuth grant `token_growth.json` mein rehta hai aur `/videos`/video statistics YouTube Data API v3, channel totals YouTube Analytics API v2 se aate hain.
+ - Email ke liye SMTP host/port ke saath `SMTP_USER`, `SMTP_PASSWORD`, aur `EMAIL_TO` bharein.
+ - Agar `NOTIFY_CHANNEL=none` hai to notification credentials ki zaroorat nahi.
+ 
++## Daily YouTube Source Refresh and Telegram Source Manager
++
++### Enabling Daily Source Refresh
++
++The in-process scheduler is integrated into the Telegram bot daemon (`python main.py telegram-bot`). To enable daily YouTube source refresh:
++
++1. In `.env`:
++   ```env
++   SCHEDULER_ENABLED=true
++   SCHEDULER_SOURCE_REFRESH_ENABLED=true
++   SCHEDULER_SOURCE_REFRESH_TIME=08:00
++   SCHEDULER_PREPARE_TIME=09:00
++   SCHEDULER_TIMEZONE=Asia/Kolkata
++   ```
++2. Alternatively, open Telegram bot `/start` -> `📚 Source Manager` -> `🕒 Daily Schedule` and click `🟢 Enable Daily Refresh`. This safely persists the toggle in `data/scheduler.json` without modifying `.env`.
++3. Workflow dependency: When both source refresh and clip preparation are enabled, `prepare` at 09:00 IST will wait for the 08:00 IST source refresh to complete successfully. If source refresh fails, dependent preparation is blocked until resolved.
++
++### Telegram Source Manager Buttons
++
++Send `/start` (or `/sources`) to access the interactive control panel:
++
++- **`📊 Source Status`**: Displays total line count, active direct video URLs, channel links, duplicate counts, conclusively consumed videos, pending eligible videos, scheduler active status, and last refresh timestamp/status.
++- **`🔎 View Summary`**: Shows tracked channels and samples of the next pending and recently used videos.
++- **`⚙️ Refresh Sources Now`**: Interactive manual refresh with confirmation (`▶️ Start Refresh` / `❌ Cancel`). Runs `make_sources` and `merge_sources` under an inter-process file lock (`work/sources.lock`), reporting scanned, appended, duplicate, and used skipped counts.
++- **`🧹 Clean Used Links`**: Safe, verified cleanup of `sources.txt`:
++  - **Authoritative Used Definition**: Only direct YouTube video URLs whose video IDs are conclusively verified as consumed in `state.json` or `data/used_videos.json` **AND** have no active, pending, processing, needs-review, or blocked clips in `review/queue.json` are eligible for removal.
++  - **Protected Entries**: Channels (e.g. `@MrBeast/videos`), pending unprocessed videos, and videos linked to active or blocked queue tasks (such as `4SNThp0YiU4`) are strictly preserved.
++  - **Preview & Confirmation**: Shows total entries, eligible removals, duplicate count, and retained lines. Requires explicit owner confirmation with a 5-minute preview token.
++  - **Atomic Backup**: Creates a timestamped backup (`sources.txt.bak_YYYYMMDD_HHMMSS`) before atomically replacing `sources.txt`.
++- **`➕ Add YouTube Source`**: Prompts the owner to send a YouTube link. Validates YouTube hostname and direct video / channel format, checks against `sources.txt` and used ledgers for deduplication, shows a confirmation preview, and atomically appends the new source upon confirmation.
++- **`🕒 Daily Schedule`**: Inspects scheduler configuration, daily refresh times, and allows toggling daily refresh on or off.
++
++### Backup and Recovery
++
++Before any cleanup modification, a backup is automatically created in the project root:
++```
++sources.txt.bak_YYYYMMDD_HHMMSS
++```
++To restore an earlier version if needed:
++```powershell
++Copy-Item sources.txt.bak_YYYYMMDD_HHMMSS sources.txt -Force
++```
++
++### Diagnosing Refresh Failures
++
++Check scheduler logs using `/logs` in Telegram or inspect `data/scheduler.json`:
++- `status`: `success_new_sources` (new links appended), `success_no_new_sources` (all candidates already present or consumed), `partial_results` (partial scrape failure), or `failed` (transient network or configuration error).
++- Detailed errors are logged in `data/scheduler.json` under `source_refresh_history` and masked in `last_error`.
++
+ ## Telegram Bot Start / Stop / Exit Lifecycle Control
 
-- BotFather se Telegram bot token lein aur bot ko chat mein start karein; channel enable karne par `TELEGRAM_CHAT_ID` bhi set karein.
-- Control commands ke liye `TELEGRAM_OWNER_IDS` mein apna numeric Telegram user ID comma-separated set karein, phir `python main.py telegram-bot` chalayein. Bot sirf private chat mein `/start`, `/help`, `/commands`, `/status`, aur `/health` accept karta hai. `TELEGRAM_OWNER_IDS` khaali ya invalid ho to polling start nahi hoti; unknown commands koi shell/code execute nahi karte. Ek local lock duplicate polling rokti hai; Telegram ka 409 conflict aane par bot band ho jata hai.
-- Monitoring ke liye `/status`, `/health`, `/queue`, `/logs`, `/task TASK_ID`, aur `/history` use karein. `/health` credentials/configuration ki maujoodgi aur saved task outcomes dikhata hai; ye provider API ko live probe nahi karta aur heartbeat akela end-to-end success ka proof nahi hai. Major stage/confirmed upload progress messages optional hain: `.env` mein `TELEGRAM_PROGRESS_ENABLED=true` karke enable karein; ye `TELEGRAM_CHAT_ID` par jaate hain.
-- Read-only reporting ke liye `/showanalytics 7d`, `/showanalytics 28d`, `/showviews VIDEO_ID`, `/showlikes VIDEO_ID`, `/showcomments VIDEO_ID`, aur `/videos` commands use karein. Analytics windows Pacific dates ke last complete 7/28 din use karte hain; YouTube latest metrics ko delay/omit kar sakta hai. `/videos` uploads playlist ko paginate karke 20 recent items tak list karta hai. Response cache nahi hai; har command live read request karti hai. OAuth grant `token_growth.json` mein rehta hai aur `/videos`/video statistics YouTube Data API v3, channel totals YouTube Analytics API v2 se aate hain.
-- Email ke liye SMTP host/port ke saath `SMTP_USER`, `SMTP_PASSWORD`, aur `EMAIL_TO` bharein.
-- Agar `NOTIFY_CHANNEL=none` hai to notification credentials ki zaroorat nahi.
+### Lifecycle States and Architecture
 
-## Security checks and tests
+PersonalAgent implements an explicit 4-state lifecycle model:
+- `STOPPED`: Application services and commands are dormant. Only the Telegram control transport is listening for lifecycle commands.
+- `STARTING`: Application services (config check, task reconciliation, scheduler) are initializing.
+- `RUNNING`: Full bot functionality is active: monitoring, control menus, queue commands, source manager, and scheduler.
+- `STOPPING`: Graceful shutdown in progress: scheduler thread is joined, pipeline tasks paused, state saved.
 
-- `.gitignore` excludes `.env`, YouTube/growth token JSON, OAuth client JSON, service-account credential JSON, PEM, and key files. Before committing, review `git status` and confirm no credential file is staged.
-- Logger redaction masks configured secret values, common API/OAuth formats, bearer headers, credential-file paths, and the current user's home path. Telegram/email payloads pass through the same redactor.
-- Run `python -m unittest discover -s tests -q` for offline tests. These tests use fakes and must not perform uploads, comments, OAuth browser login, or provider API writes.
+### Two-Layer Architecture
+
+1. **Control Transport (Supervisor / Poller)**: Remains online even when the bot is `STOPPED`. This allows the authorized owner to send `/start` or click `▶️ Start Bot` at any time without needing SSH or server terminal access.
+2. **Application Services**: Includes command router, AI natural language classifier, source refresh, video preparation, queue processor, and daily scheduler. These are strictly stopped and isolated when state is `STOPPED`.
+
+### Startup Gate Behavior
+
+When the bot is `STOPPED`:
+- Sending `/start` displays the startup welcome menu explaining that application services are currently stopped, along with `▶️ Start Bot` and `🚪 Exit` controls.
+- Any other incoming command or message (`/status`, `/upload`, `/help`, `Prepare clips`, unknown commands, etc.) is intercepted with:
+  ```
+  Please first start the bot.
+  ```
+  along with `▶️ Start Bot` and `🚪 Exit` controls.
+- No protected command execution, background tasks, or AI intent queries occur.
+- Repeated messages receive exactly one response each; duplicate execution is prevented.
+
+### Interactive Lifecycle Buttons
+
+- **`▶️ Start Bot` (`life:start`)**:
+  - Verifies owner authorization.
+  - Reconciles active task status and unpauses pipeline checkpoints.
+  - Starts the scheduler thread if configured and enabled.
+  - Sets state to `RUNNING` and presents the main control menu.
+  - If startup encounters an error, state is cleanly reset to `STOPPED` and an error is logged.
+- **`⏹️ Stop Bot` (`life:stop_prompt`)**:
+  - Prompts owner with `⏹️ Confirm Stop` and `❌ Cancel`.
+  - On confirmation, stops scheduler gracefully, pauses background pipeline execution, and transitions to `STOPPED`.
+  - Preserves all queue items, `sources.txt`, upload history, and pending approval tokens.
+  - Control transport remains active with `▶️ Start Bot` available.
+- **`🚪 Exit` (`life:exit_prompt`)**:
+  - Prompts owner with `🚪 Yes, Exit` and `❌ Cancel`.
+  - On confirmation, stops application services, marks state `STOPPED`, and signals the polling loop to release the lock (`PollLock`) and terminate the Python process cleanly.
+
+### Supervisor and Auto-Restart Configuration
+
+When deployed under Docker (`restart: unless-stopped`) or systemd (`Restart=always`):
+- Upon boot, `reconcile_lifecycle_on_boot()` reconciles the persisted state. A previous `RUNNING` or `STARTING` state from an unexpected crash is automatically reset to `STOPPED` to prevent unsafe restart loops.
+- To allow the bot to auto-start immediately upon container/service launch, set in `.env`:
+  ```env
+  BOT_AUTO_START=true
+  ```
+  (Defaults to `false`, requiring the owner to click `▶️ Start Bot`).
+
+

@@ -3,6 +3,7 @@ import json
 import copy
 import math
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -132,9 +133,12 @@ def reconcile_tasks(data=None):
     return _mutate(_do_reconcile)
 
 
-def launch(kind, owner_id, chat_id, *, draft_limit=None, scheduler_key=None, request_key=None):
+def launch(kind, owner_id, chat_id, *, draft_limit=None, scheduler_key=None, request_key=None,
+           target_clip_id=None, before_start=None, rollback_start=None):
     if kind not in {"prepare", "upload"}:
         raise ValueError("Unsupported task type.")
+    if target_clip_id is not None and (kind != "upload" or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", str(target_clip_id))):
+        raise ValueError("A targeted upload requires a valid clip ID.")
     if request_key is not None and (not isinstance(request_key, str) or not request_key or len(request_key) > 256):
         raise ValueError("Invalid task request key.")
     task_id = uuid.uuid4().hex[:12]
@@ -156,6 +160,8 @@ def launch(kind, owner_id, chat_id, *, draft_limit=None, scheduler_key=None, req
             tasks[task_id]["request_key"] = request_key
         if scheduler_key:
             tasks[task_id]["scheduler_key"] = scheduler_key
+        if target_clip_id is not None:
+            tasks[task_id]["target_clip_id"] = str(target_clip_id)
         return tasks[task_id]
     _mutate(add)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -166,6 +172,10 @@ def launch(kind, owner_id, chat_id, *, draft_limit=None, scheduler_key=None, req
                 "AGENT_CONTROL_CHAT_ID": str(chat_id)})
     if draft_limit is not None:
         env["CLIPS_PER_DAY"] = str(max(1, min(4, int(draft_limit))))
+    if target_clip_id is not None:
+        env["AGENT_CONTROL_CLIP_ID"] = str(target_clip_id)
+    else:
+        env.pop("AGENT_CONTROL_CLIP_ID", None)
     command = [sys.executable, "main.py", "prepare" if kind == "prepare" else "render"]
     options = {"cwd": str(Path.cwd()), "env": env, "stdin": subprocess.DEVNULL,
                "stdout": stream, "stderr": subprocess.STDOUT, "close_fds": True}
@@ -174,6 +184,8 @@ def launch(kind, owner_id, chat_id, *, draft_limit=None, scheduler_key=None, req
     else:
         options["start_new_session"] = True
     try:
+        if before_start:
+            before_start()
         process = subprocess.Popen(command, **options)
     except Exception:
         stream.close()
@@ -181,11 +193,21 @@ def launch(kind, owner_id, chat_id, *, draft_limit=None, scheduler_key=None, req
             data["tasks"][task_id]["status"] = "failed"
             data["tasks"][task_id]["finished_at"] = time.time()
         _mutate(fail)
+        if rollback_start:
+            try:
+                rollback_start()
+            except Exception:
+                pass
         raise
     stream.close()
     def started(data):
         data["tasks"][task_id].update(status="running", pid=process.pid, started_at=time.time(), log=str(log_path))
     _mutate(started)
+    try:
+        from telegram_bot.progress import start_task_progress
+        start_task_progress(task_id, kind, chat_id=chat_id)
+    except Exception:
+        pass
     threading.Thread(target=_watch_process, args=(task_id, process), daemon=True,
                      name=f"telegram-task-{task_id}").start()
     return task_id
@@ -324,6 +346,13 @@ def cancel(task_id, owner_id):
             return f"Task already finished: {task.get('status')}."
         task["cancel_requested"] = True
         task["status"] = "cancelling"
+        try:
+            from telegram_bot.progress import get_tracker
+            tracker = get_tracker(task_id)
+            if tracker:
+                tracker.set_status("CANCELLING")
+        except Exception:
+            pass
         return "Cancellation requested. It will stop at the next safe checkpoint; an in-flight YouTube upload cannot be interrupted."
     return _mutate(apply)
 
@@ -373,10 +402,24 @@ def checkpoint(*, clip=None, ask_upload=False):
             return "cancel"
         if state.get("paused"):
             _mutate(lambda data: data.get("tasks", {}).get(task_id, {}).update(status="paused"))
+            try:
+                from telegram_bot.progress import get_tracker
+                tracker = get_tracker(task_id)
+                if tracker:
+                    tracker.set_status("PAUSED")
+            except Exception:
+                pass
             time.sleep(1)
             continue
         if task.get("status") != "running":
             _mutate(lambda data: data.get("tasks", {}).get(task_id, {}).update(status="running"))
+            try:
+                from telegram_bot.progress import get_tracker
+                tracker = get_tracker(task_id)
+                if tracker and tracker.record.get("status") in {"PAUSED", "WAITING_CONFIRMATION"}:
+                    tracker.set_status("RUNNING")
+            except Exception:
+                pass
         if not ask_upload:
             return "continue"
         clip_id = str((clip or {}).get("id", ""))
@@ -411,6 +454,14 @@ def checkpoint(*, clip=None, ask_upload=False):
                     return None, False
                 data["confirmation"] = candidate
                 current_task["status"] = "waiting_confirmation"
+                try:
+                    from telegram_bot.progress import get_tracker
+                    tracker = get_tracker(task_id)
+                    if tracker:
+                        clip_title = (clip or {}).get("title") or clip_id
+                        tracker.set_status("WAITING_CONFIRMATION", detail=f"Awaiting upload confirmation for '{clip_title}'")
+                except Exception:
+                    pass
                 return candidate, True
             confirmation, created = _mutate(create_confirmation)
             if confirmation is None:
@@ -509,6 +560,13 @@ def finish(task_id, status, *, error=None, result=None):
         if _confirmation_belongs_to(data, task_id):
             data["confirmation"] = None
     _mutate(apply)
+    try:
+        from telegram_bot.progress import get_tracker
+        tracker = get_tracker(task_id)
+        if tracker:
+            tracker.finish(status=status, error=error)
+    except Exception:
+        pass
 
 
 def record_notification_result(task_id, notification, sent, error=None):
@@ -583,3 +641,133 @@ def retry_task(task_id, owner_id, chat_id):
     save_queue(queue)
     new_task = launch("upload", owner_id, chat_id)
     return f"Requeued {len(retried)} eligible clip(s); started upload task {new_task}. Each public upload still requires confirmation."
+
+
+def _blocked_upload_context(clip_id, owner_id):
+    """Read and validate one blocked account-limit clip without changing queue state."""
+    if not _is_authorized_owner(owner_id):
+        return None, "This recovery action is owner-only."
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", str(clip_id or "")):
+        return None, "Invalid clip ID. Open Queue again and select a blocked clip."
+
+    queue_path = Path(os.getenv("REVIEW_DIR", "review")) / "queue.json"
+    try:
+        from queue_manager import load_queue
+        queue = load_queue(queue_path)
+    except Exception:
+        return None, "The saved queue could not be verified; no retry was started. Check the local run log."
+    matches = [item for item in queue if str(item.get("id", "")) == str(clip_id)]
+    if len(matches) != 1:
+        return None, "This clip is missing or has duplicate queue records; no retry was started. Review the queue first."
+    item = matches[0]
+    stable_key = str(item.get("key") or "")
+    if stable_key and sum(str(row.get("key") or "") == stable_key for row in queue) != 1:
+        return None, "This clip has duplicate queue identities; no retry was started. Reconcile the queue first."
+    if item.get("status") != "blocked":
+        return None, f"This clip is no longer blocked (current status: {item.get('status', 'unknown')}). Refresh Queue."
+    error_details = item.get("upload_error_details")
+    detail_rows = error_details.get("details", []) if isinstance(error_details, dict) else []
+    account_limit_confirmed = (
+        item.get("upload_error") == "uploadLimitExceeded"
+        and isinstance(detail_rows, list)
+        and any(isinstance(row, dict) and row.get("reason") == "uploadLimitExceeded"
+                for row in detail_rows)
+    )
+    if not account_limit_confirmed:
+        return None, "This blocked clip does not have a verified account upload-limit error. Use the matching recovery procedure; no retry was started."
+    if item.get("youtube_video_id"):
+        return None, "A YouTube video ID/publication record is already attached to this clip. No retry was started; verify it in YouTube Studio."
+
+    try:
+        from state_manager import load_state, is_clip_already_uploaded
+        state = load_state()
+        if not stable_key:
+            return None, "This clip has no stable queue key; no retry was started. Reconcile it manually."
+        if is_clip_already_uploaded(state, stable_key):
+            return None, "Saved pipeline state marks this clip as uploaded. No retry was started; verify its publication record and YouTube Studio."
+        from telegram_bot import monitoring
+        monitor_path = Path(monitoring.MONITOR_FILE)
+        if monitor_path.exists():
+            monitor = json.loads(monitor_path.read_text(encoding="utf-8"))
+            if not isinstance(monitor, dict):
+                raise ValueError("invalid publication registry")
+            identities = {str(item.get("id")), str(item.get("key"))}
+            for result in monitor.get("task_results", []):
+                if not isinstance(result, dict) or result.get("task") not in {f"clip:{identity}" for identity in identities}:
+                    continue
+                if result.get("status") in {"success", "uncertain", "interrupted"}:
+                    return None, "A saved publication result is successful or uncertain. No retry was started; verify YouTube Studio and reconcile the record."
+        attempts = item.get("recovery_attempts", 0)
+        if type(attempts) is not int or attempts < 0:
+            raise ValueError("invalid recovery attempt state")
+    except Exception:
+        return None, "Saved upload records could not be verified safely; no retry was started. Check YouTube Studio and local state first."
+
+    return {"item": item, "queue_path": queue_path, "recovery_attempts": attempts}, None
+
+
+def inspect_blocked_upload(clip_id, owner_id):
+    """Return safe retry-preview details only when local records allow review."""
+    context, error = _blocked_upload_context(clip_id, owner_id)
+    if error:
+        return {"error": error}
+    item = context["item"]
+    return {"id": str(item["id"]), "title": str(item.get("title") or item["id"])[:100],
+            "attempt": context["recovery_attempts"]}
+
+
+def recover_blocked_upload(clip_id, expected_attempt, owner_id, chat_id):
+    """Start one targeted retry after an owner explicitly attests Studio and limit checks."""
+    context, error = _blocked_upload_context(clip_id, owner_id)
+    if error:
+        return error
+    if type(expected_attempt) is not int or expected_attempt < 0:
+        return "This recovery request is invalid. Reopen Queue and review the clip again."
+    if context["recovery_attempts"] != expected_attempt:
+        return "This recovery button is stale or already used. Reopen Queue and review the clip again."
+
+    from queue_manager import load_queue, save_queue
+    queue_path = context["queue_path"]
+    retry_count = expected_attempt + 1
+
+    def activate_clip():
+        fresh, fresh_error = _blocked_upload_context(clip_id, owner_id)
+        if fresh_error:
+            raise RuntimeError(fresh_error)
+        if fresh["recovery_attempts"] != expected_attempt:
+            raise RuntimeError("This recovery request was already handled. Refresh Queue.")
+        queue = load_queue(queue_path)
+        item = next(row for row in queue if str(row.get("id", "")) == str(clip_id))
+        item["status"] = "pending"
+        item["recovery_attempts"] = retry_count
+        item["last_recovery_at"] = time.time()
+        item["last_recovery_note"] = "Owner confirmed YouTube Studio check and one explicit retry."
+        item.pop("processing_step", None)
+        item.pop("processing_started_at", None)
+        save_queue(queue_path, queue)
+
+    def restore_blocked_after_start_failure():
+        queue = load_queue(queue_path)
+        item = next((row for row in queue if str(row.get("id", "")) == str(clip_id)), None)
+        if (item and item.get("status") == "pending"
+                and int(item.get("recovery_attempts", 0)) == retry_count):
+            item["status"] = "blocked"
+            item["recovery_attempts"] = expected_attempt
+            item.pop("last_recovery_at", None)
+            item.pop("last_recovery_note", None)
+            save_queue(queue_path, queue)
+
+    try:
+        task_id = launch(
+            "upload", owner_id, chat_id,
+            request_key=f"blocked-recovery:{clip_id}:{retry_count}",
+            target_clip_id=clip_id,
+            before_start=activate_clip,
+            rollback_start=restore_blocked_after_start_failure,
+        )
+    except DuplicateTaskRequest as duplicate:
+        return f"This retry was already accepted as task {duplicate.task_id} ({duplicate.status}). Check Task Status; do not click again."
+    except RuntimeError as exc:
+        return str(exc)
+    return (f"One targeted retry started for clip {clip_id} as task {task_id}. "
+            "It will ask for the existing separate per-clip public-upload approval before contacting YouTube.")

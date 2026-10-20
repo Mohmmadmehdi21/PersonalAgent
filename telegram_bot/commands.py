@@ -12,20 +12,26 @@ DATA_DIR = Path("data")
 QUEUE_FILE = Path(os.getenv("REVIEW_DIR", "review")) / "queue.json"
 COMMAND_NAMES = ("start", "help", "commands", "status", "health", "queue", "logs", "task", "history",
                  "showanalytics", "showviews", "showlikes", "showcomments", "videos",
-                 "review", "prepare", "upload", "pause", "resume", "cancel", "retry", "confirm", "deny")
+                 "review", "prepare", "upload", "pause", "resume", "cancel", "retry", "confirm", "deny",
+                 "sources", "sourcemanager")
 
 
 def _commands(_message):
     return ("Available commands: /start, /help, /commands, /status, /health, /queue, /review, /logs, "
             "/task TASK_ID, /history, /showanalytics 7d|28d, /showviews VIDEO_ID, "
-            "/showlikes VIDEO_ID, /showcomments VIDEO_ID, /videos. You can also ask in plain language, "
+            "/showlikes VIDEO_ID, /showcomments VIDEO_ID, /videos, /sources. You can also ask in plain language, "
             "for example: 'last 7 days analytics', 'count upload-ready clips', 'explain latest error', "
             "'prepare clips but do not upload', or 'pause the queue'.")
 
 
 def _start(_message):
+    from telegram_bot import lifecycle
+    if lifecycle.get_state() == lifecycle.STATE_STOPPED:
+        return ("PersonalAgent is currently stopped.\n\n"
+                "Application services, queue processing, and scheduled jobs are paused.\n"
+                "Choose an option below to start the bot or exit.")
     return ("PersonalAgent monitoring menu. Choose an option to view the current task, queue, health, "
-            "or clips that need review. These controls are for monitoring and read-only review.")
+            "clips that need review, or open the Source Manager. These controls are for monitoring and safe management.")
 
 
 def _menu_keyboard():
@@ -33,7 +39,34 @@ def _menu_keyboard():
         [{"text": "Task Status", "callback_data": "pa1:status"}, {"text": "Queue", "callback_data": "pa1:queue:0"}],
         [{"text": "Health", "callback_data": "pa1:health"}, {"text": "Review Clips", "callback_data": "pa1:review:0"}],
         [{"text": "Prepare Clips", "callback_data": "pa2:prepare"}],
+        [{"text": "📚 Source Manager", "callback_data": "src:menu"}],
+        [{"text": "⏹️ Stop Bot", "callback_data": "life:stop_prompt"}, {"text": "🚪 Exit", "callback_data": "life:exit_prompt"}],
         [{"text": "Help", "callback_data": "pa1:help"}],
+    ]}
+
+
+def _stopped_keyboard():
+    return {"inline_keyboard": [
+        [{"text": "▶️ Start Bot", "callback_data": "life:start"}],
+        [{"text": "🚪 Exit", "callback_data": "life:exit_prompt"}],
+    ]}
+
+
+
+def _source_menu_keyboard():
+    return {"inline_keyboard": [
+        [{"text": "📊 Source Status", "callback_data": "src:status"}, {"text": "🔎 View Summary", "callback_data": "src:summary"}],
+        [{"text": "⚙️ Refresh Sources Now", "callback_data": "src:refresh_confirm"}],
+        [{"text": "🧹 Clean Used Links", "callback_data": "src:clean_preview"}],
+        [{"text": "➕ Add YouTube Source", "callback_data": "src:add_prompt"}],
+        [{"text": "🕒 Daily Schedule", "callback_data": "src:schedule"}],
+        [{"text": "⬅️ Back to Main Menu", "callback_data": "pa1:home"}],
+    ]}
+
+
+def _source_back_keyboard():
+    return {"inline_keyboard": [
+        [{"text": "📚 Source Manager", "callback_data": "src:menu"}, {"text": "Main Menu", "callback_data": "pa1:home"}],
     ]}
 
 
@@ -48,14 +81,54 @@ def _page_keyboard(kind, page, total):
     return {"inline_keyboard": rows}
 
 
+def _queue_page_keyboard(items, page, total):
+    """Queue navigation plus per-item recovery entry points for blocked clips."""
+    rows = []
+    order = ("pending", "processing", "needs_review", "failed", "blocked", "uploaded")
+    entries = [item for state in order for item in items if (item.get("status") or "pending") == state]
+    entries.extend(item for item in items if (item.get("status") or "pending") not in order)
+    for item in entries[page * 5:page * 5 + 5]:
+        if item.get("status") != "blocked":
+            continue
+        clip_id = str(item.get("id") or "")
+        if re.fullmatch(r"[A-Za-z0-9_-]{1,32}", clip_id):
+            title = str(item.get("title") or clip_id).strip()
+            label = title[:24] + "…" if len(title) > 25 else title
+            rows.append([{"text": f"Review blocked: {label}", "callback_data": f"br:view:{clip_id}"}])
+    nav = []
+    if page > 0:
+        nav.append({"text": "← Previous", "callback_data": f"pa1:queue:{page - 1}"})
+    if (page + 1) * 5 < total:
+        nav.append({"text": "Next →", "callback_data": f"pa1:queue:{page + 1}"})
+    if nav:
+        rows.append(nav)
+    rows.append([{"text": "Main Menu", "callback_data": "pa1:home"}])
+    return {"inline_keyboard": rows}
+
+
 def _callback_action(data):
-    """Parse only the small, explicit Phase 1 callback allowlist."""
+    """Parse allowlisted callbacks for menu, navigation, and source manager."""
     if not isinstance(data, str) or len(data) > 64:
         return None
     if data in {"pa1:status", "pa1:health", "pa1:help", "pa1:home", "pa2:prepare"}:
         return data.split(":", 1)[1], 0
     match = re.fullmatch(r"pa1:(queue|review):(0|[1-9][0-9]{0,3})", data)
-    return (match.group(1), int(match.group(2))) if match else None
+    if match:
+        return match.group(1), int(match.group(2))
+    if data in {"src:menu", "src:status", "src:summary", "src:refresh_confirm", "src:refresh_start",
+                "src:clean_preview", "src:add_prompt", "src:schedule", "src:sched_enable", "src:sched_disable"}:
+        return data.replace("src:", "src_"), ""
+    src_match = re.fullmatch(r"src:(clean_confirm|clean_cancel|add_confirm|add_cancel):([A-Za-z0-9_-]{1,32})", data)
+    if src_match:
+        return f"src_{src_match.group(1)}", src_match.group(2)
+    blocked_view = re.fullmatch(r"br:view:([A-Za-z0-9_-]{1,32})", data)
+    if blocked_view:
+        return "blocked_view", blocked_view.group(1)
+    blocked_retry = re.fullmatch(r"br:retry:([A-Za-z0-9_-]{1,32}):(0|[1-9][0-9]{0,5})", data)
+    if blocked_retry:
+        return "blocked_retry", (blocked_retry.group(1), int(blocked_retry.group(2)))
+    return None
+
 
 
 def _callback_response(action, page, *, queue_reader=None, heartbeat_reader=None, max_hours=None,
@@ -86,7 +159,28 @@ def _callback_response(action, page, *, queue_reader=None, heartbeat_reader=None
         text, count = _render_queue_page(items, page)
         if page and page * 5 >= count:
             return "This queue page is no longer available. Return to Main Menu and reopen Queue.", _home_keyboard()
-        return text, _page_keyboard("queue", page, count)
+        return text, _queue_page_keyboard(items, page, count)
+    if action == "blocked_view":
+        from telegram_bot.control import inspect_blocked_upload
+        info = inspect_blocked_upload(page, (message.get("from") or {}).get("id"))
+        if info.get("error"):
+            return info["error"], _home_keyboard()
+        text = (f"Blocked clip recovery — {info['title']}\n\n"
+                f"Clip ID: {info['id']}\n"
+                "The saved YouTube response is an account upload-limit rejection. Local queue, state, and recent publication records show no successful or uncertain result for this clip.\n\n"
+                "Before continuing, check YouTube Studio: confirm this clip is not already present and the channel can upload again. The next button records your check; the existing separate upload approval will still be required.")
+        keyboard = {"inline_keyboard": [
+            [{"text": "I checked Studio; retry this clip", "callback_data": f"br:retry:{info['id']}:{info['attempt']}"}],
+            [{"text": "Cancel", "callback_data": "pa1:queue:0"}],
+        ]}
+        return text, keyboard
+    if action == "blocked_retry":
+        from telegram_bot.control import recover_blocked_upload
+        clip_id, attempt = page
+        text = recover_blocked_upload(clip_id, attempt,
+                                      (message.get("from") or {}).get("id"),
+                                      (message.get("chat") or {}).get("id"))
+        return text, _home_keyboard()
     if action == "review":
         items = (queue_reader or _read_queue)()
         review_items = [item for item in items if _eligible_for_review(item)]
@@ -94,7 +188,233 @@ def _callback_response(action, page, *, queue_reader=None, heartbeat_reader=None
         if page and page * 5 >= count:
             return "This review page is no longer available. Return to Main Menu and reopen Review Clips.", _home_keyboard()
         return text, _page_keyboard("review", page, count)
+    if action == "src_menu":
+        return ("📚 PersonalAgent Source Manager\n\n"
+                "Manage YouTube sources, check status, trigger daily refresh, clean used links, or add new sources."), _source_menu_keyboard()
+    if action == "src_status":
+        return _render_source_status(), _source_back_keyboard()
+    if action == "src_summary":
+        return _render_source_summary(), _source_back_keyboard()
+    if action == "src_refresh_confirm":
+        text = ("⚙️ Refresh Sources Now\n\n"
+                "Are you sure you want to trigger an immediate YouTube source refresh?\n"
+                "This will scan configured channels, discover new eligible long videos (15+ min), "
+                "and append unseen ones to sources.txt.")
+        kb = {"inline_keyboard": [
+            [{"text": "▶️ Start Refresh", "callback_data": "src:refresh_start"}],
+            [{"text": "❌ Cancel", "callback_data": "src:menu"}],
+        ]}
+        return text, kb
+    if action == "src_refresh_start":
+        from telegram_bot import source_manager
+        chat_id = message.get("chat", {}).get("id") if isinstance(message, dict) else None
+        try:
+            record = source_manager.run_source_refresh(chat_id=chat_id)
+            status_text = (
+                "⚙️ Source Refresh Complete\n\n"
+                f"• Status: {record['status']}\n"
+                f"• Duration: {record['duration_seconds']}s\n"
+                f"• Timezone: {record['timezone']}\n"
+                f"• Sources scanned: {record['sources_scanned']}\n"
+                f"• New links found: {record['new_links_found']}\n"
+                f"• Links appended: {record['links_appended']}\n"
+                f"• Duplicates skipped: {record['duplicates_skipped']}\n"
+                f"• Used links skipped: {record['used_skipped']}\n"
+            )
+            if record.get("error"):
+                status_text += f"• Error detail: {record['error'][:200]}\n"
+            return status_text, _source_back_keyboard()
+        except RuntimeError as exc:
+            if "in progress" in str(exc).lower():
+                return "⚠️ Another source operation is currently running. Please wait for it to finish.", _source_back_keyboard()
+            raise
+    if action == "src_clean_preview":
+        from telegram_bot import source_manager
+        try:
+            proposal = source_manager.preview_cleanup()
+            if proposal["eligible_used_count"] == 0 and proposal["duplicate_count"] == 0:
+                return ("🧹 Clean Used Links\n\n"
+                        "No eligible used video links or duplicates found to clean.\n"
+                        "All direct video URLs are either pending, protected, or channels."), _source_back_keyboard()
+            sample_lines = [f"  • {item['vid']} ({item['reason']})" for item in proposal["eligible_removals"][:4]]
+            for item in proposal.get("duplicate_removals", [])[:2]:
+                sample_lines.append(f"  • {item['vid']} ({item['reason']})")
+            sample_str = "\n".join(sample_lines)
+            text = (
+                "🧹 Clean Used Links — Preview\n\n"
+                f"• Total source lines: {proposal['total_lines']}\n"
+                f"• Conclusively used links: {proposal['eligible_used_count']}\n"
+                f"• Duplicate entries: {proposal['duplicate_count']}\n"
+                f"• Lines to retain: {proposal['retained_count']}\n\n"
+                f"Proposed removals (sample):\n{sample_str}\n\n"
+                "🛡️ Protected entries (channels, pending videos, and blocked clips) will NOT be removed.\n"
+                "A timestamped backup of sources.txt will be created before any changes.\n\n"
+                "Proceed with cleanup?"
+            )
+            kb = {"inline_keyboard": [
+                [{"text": "✅ Confirm Cleanup", "callback_data": f"src:clean_confirm:{proposal['preview_id']}"}],
+                [{"text": "❌ Cancel", "callback_data": f"src:clean_cancel:{proposal['preview_id']}"}],
+            ]}
+            return text, kb
+        except RuntimeError as exc:
+            if "in progress" in str(exc).lower():
+                return "⚠️ Another source operation is currently running. Please wait for it to finish.", _source_back_keyboard()
+            raise
+    if action == "src_clean_confirm":
+        from telegram_bot import source_manager
+        chat_id = message.get("chat", {}).get("id") if isinstance(message, dict) else None
+        try:
+            res = source_manager.execute_cleanup(page, chat_id=chat_id)
+            text = (
+                "🧹 Cleanup Completed Successfully\n\n"
+                f"• Removed used links: {res['removed_used']}\n"
+                f"• Removed duplicates: {res['removed_duplicates']}\n"
+                f"• Remaining lines in sources.txt: {res['remaining_lines']}\n"
+                f"• Backup created: {Path(res['backup_path']).name}\n\n"
+                "All channels and protected videos were preserved."
+            )
+            return text, _source_back_keyboard()
+        except ValueError as exc:
+            return f"⚠️ Cleanup aborted: {str(exc)}", _source_back_keyboard()
+        except RuntimeError as exc:
+            if "in progress" in str(exc).lower():
+                return "⚠️ Another source operation is currently running. Please wait for it to finish.", _source_back_keyboard()
+            raise
+    if action == "src_clean_cancel":
+        from telegram_bot import source_manager
+        source_manager.cancel_cleanup(page)
+        return "Cleanup cancelled. sources.txt was not modified.", _source_back_keyboard()
+    if action == "src_add_prompt":
+        from telegram_bot import source_manager
+        user_id = message.get("from", {}).get("id")
+        source_manager.set_pending_input(user_id, "add_source")
+        text = (
+            "➕ Add YouTube Source\n\n"
+            "Please paste the YouTube URL you want to add to sources.txt:\n\n"
+            "Supported formats:\n"
+            "• Direct video: https://www.youtube.com/watch?v=...\n"
+            "• Short video link: https://youtu.be/...\n"
+            "• Channel: https://www.youtube.com/@ChannelName/videos\n\n"
+            "Reply with the URL, or send /cancel to abort."
+        )
+        return text, _source_back_keyboard()
+    if action == "src_add_confirm":
+        from telegram_bot import source_manager
+        try:
+            res = source_manager.append_new_source(page)
+            text = (
+                "✅ YouTube Source Added\n\n"
+                f"• URL: {res['added_url']}\n"
+                f"• Type: {res['source_type']}\n"
+                f"• Total sources: {res['total_sources']}\n\n"
+                "The source is now recorded and available for clipping."
+            )
+            return text, _source_back_keyboard()
+        except ValueError as exc:
+            return f"⚠️ Addition rejected: {str(exc)}", _source_back_keyboard()
+        except RuntimeError as exc:
+            if "in progress" in str(exc).lower():
+                return "⚠️ Another source operation is currently running. Please wait for it to finish.", _source_back_keyboard()
+            raise
+    if action == "src_add_cancel":
+        return "Source addition cancelled.", _source_back_keyboard()
+    if action == "src_schedule":
+        from telegram_bot import source_manager
+        cfg = source_manager.get_scheduler_config()
+        return _render_daily_schedule(), _schedule_keyboard(cfg["source_refresh_enabled"])
+    if action == "src_sched_enable":
+        from telegram_bot import source_manager
+        source_manager.set_scheduler_config("source_refresh_enabled", True)
+        source_manager.set_scheduler_config("scheduler_enabled", True)
+        return "✅ Daily source refresh enabled!\n\n" + _render_daily_schedule(), _schedule_keyboard(True)
+    if action == "src_sched_disable":
+        from telegram_bot import source_manager
+        source_manager.set_scheduler_config("source_refresh_enabled", False)
+        return "⏸️ Daily source refresh disabled.\n\n" + _render_daily_schedule(), _schedule_keyboard(False)
     return "This menu action is unavailable. Send /start for a fresh menu.", None
+
+
+def _render_source_status():
+    from telegram_bot import source_manager
+    st = source_manager.get_sources_status()
+    last_att = datetime.fromtimestamp(st["last_attempt"], timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if st["last_attempt"] else "Unknown / not recorded"
+    last_succ = datetime.fromtimestamp(st["last_success"], timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if st["last_success"] else "Unknown / not recorded"
+
+    last_err = "None"
+    if st["last_error"]:
+        from logger import mask_secrets
+        last_err = mask_secrets(str(st["last_error"]))[:200]
+
+    next_sched = f"Daily at {st['refresh_time']} {st['timezone']}" if st["refresh_enabled"] and st["scheduler_enabled"] else "Disabled"
+
+    return (
+        "📊 YouTube Sources Status\n\n"
+        f"• Total source lines: {st['total_lines']}\n"
+        f"• Active entries: {st['active_entries']}\n"
+        f"• Unique direct video URLs: {st['direct_video_count']}\n"
+        f"• Channel / handle URLs: {st['channel_count']}\n"
+        f"• Duplicate entries: {st['duplicate_count']}\n"
+        f"• Used / consumed links: {st['used_count']}\n"
+        f"• Pending eligible videos: {st['pending_count']}\n\n"
+        "🕒 Refresh Schedule & History:\n"
+        f"• Scheduler active: {'Yes' if st['scheduler_enabled'] else 'No'}\n"
+        f"• Daily refresh enabled: {'Yes' if st['refresh_enabled'] else 'No'}\n"
+        f"• Next scheduled refresh: {next_sched}\n"
+        f"• Last refresh attempt: {last_att}\n"
+        f"• Last successful refresh: {last_succ}\n"
+        f"• Last refresh result: {st['last_result']}\n"
+        f"• Last error: {last_err}"
+    )
+
+
+def _render_source_summary():
+    from telegram_bot import source_manager
+    summary = source_manager.get_source_summary(limit=4)
+    pending_lines = [f"  • {item['id']} ({item['url']})" for item in summary["pending_sample"]]
+    used_lines = [f"  • {item['id']} ({item['url']})" for item in summary["used_sample"]]
+    channel_lines = [f"  • {ch}" for ch in summary["channels"]]
+
+    return (
+        "🔎 Source Summary Overview\n\n"
+        f"Total active sources: {summary['total_active']}\n"
+        f"• Pending videos: {summary['total_pending']}\n"
+        f"• Conclusively used videos: {summary['total_used']}\n"
+        f"• Tracked channels: {len(summary['channels'])}\n\n"
+        "📺 Tracked Channels:\n" + ("\n".join(channel_lines) if channel_lines else "  None") + "\n\n"
+        "⏳ Next Pending Videos (sample):\n" + ("\n".join(pending_lines) if pending_lines else "  None") + "\n\n"
+        "✅ Recently Used Videos (sample):\n" + ("\n".join(used_lines) if used_lines else "  None")
+    )
+
+
+def _render_daily_schedule():
+    from telegram_bot import source_manager
+    cfg = source_manager.get_scheduler_config()
+    st = source_manager.get_sources_status()
+    last_att = datetime.fromtimestamp(st["last_attempt"], timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if st["last_attempt"] else "Never"
+
+    return (
+        "🕒 Daily Schedule Settings\n\n"
+        f"• Scheduler active: {'✅ Enabled' if cfg['scheduler_enabled'] else '❌ Disabled'}\n"
+        f"• Daily source refresh: {'✅ Enabled' if cfg['source_refresh_enabled'] else '❌ Disabled'}\n"
+        f"• Timezone: {cfg['timezone']}\n"
+        f"• Daily refresh time: {cfg['source_refresh_time']}\n"
+        f"• Preparation time: {cfg['prepare_time']}\n"
+        f"• Last refresh attempt: {last_att}\n"
+        f"• Last refresh status: {st['last_result']}\n\n"
+        "Daily refresh scans official channels for new long videos (15+ min) and safely appends them without duplicates."
+    )
+
+
+def _schedule_keyboard(refresh_enabled):
+    toggle_btn = (
+        {"text": "🔴 Disable Daily Refresh", "callback_data": "src:sched_disable"}
+        if refresh_enabled
+        else {"text": "🟢 Enable Daily Refresh", "callback_data": "src:sched_enable"}
+    )
+    return {"inline_keyboard": [
+        [toggle_btn],
+        [{"text": "📚 Source Manager", "callback_data": "src:menu"}, {"text": "Main Menu", "callback_data": "pa1:home"}],
+    ]}
 
 
 def _home_keyboard():
@@ -105,9 +425,11 @@ def _menu_help():
     return ("Monitoring menu: Task Status shows saved task state and verified process activity; Queue shows "
             "read-only queue counts and entries; Health shows configuration, recorded checks, and local storage; "
             "Review Clips lists items currently marked needs_review. Prepare Clips starts the existing background "
-            "preparation pipeline and does not publish. Use Main Menu to return. Supported monitoring "
-            "commands: /start, /help, /status, /queue, /health, /review. Other existing bot commands remain "
-            "available through /help. Upload remains outside this menu action.")
+            "preparation pipeline and does not publish. Source Manager provides interactive inspection, manual refresh, "
+            "safe cleanup of conclusively used videos, and YouTube source addition. Use Main Menu to return. "
+            "Supported monitoring commands: /start, /help, /status, /queue, /health, /review, /sources. "
+            "Upload remains outside this menu action.")
+
 
 
 def _safe_storage_snapshot():
@@ -126,6 +448,7 @@ def _safe_storage_snapshot():
 
 def _help(_message):
     return ("Commands:\n/start, /help, /commands\n/status — current stage/task and queue counts"
+            "\n/sources, /sourcemanager — YouTube sources status, refresh, and manager"
             "\n/health — integration/config status and last error\n/queue — queue items\n/logs — recent redacted logs"
             "\n/task TASK_ID — task state\n/history — recent task results"
             "\n/showanalytics 7d|28d — channel Analytics report\n/showviews VIDEO_ID /showlikes VIDEO_ID /showcomments VIDEO_ID"
@@ -137,6 +460,7 @@ def _help(_message):
             "\n/confirm CODE, /deny CODE — decide a pending public upload"
             "\nYou can ask naturally too: 'last 7 days analytics', 'count upload-ready clips', "
             "'explain latest error', 'prepare clips but do not upload', or 'pause the queue'.")
+
 
 
 def _status(_message, queue_reader=None, monitor_reader=None):
@@ -179,6 +503,15 @@ def _status(_message, queue_reader=None, monitor_reader=None):
         task, live_state, stage = task_states[0]
         status = task.get("status", "unknown")
         lines = [f"Telegram task {task.get('id', 'unknown')} ({task.get('kind', 'task')}): {status}; {live_state}."]
+        try:
+            from telegram_bot import progress
+            prog_data = progress.get_task_progress(task.get("id"))
+            if prog_data:
+                lines.append("")
+                lines.append(progress.format_progress_message(prog_data))
+                lines.append("")
+        except Exception:
+            pass
         if stage:
             stage_label = "Current recorded processing stage" if live_state == "process active" else "Last recorded processing stage"
             lines.append(f"{stage_label}: {monitoring.mask_secrets(str(stage)[:100])}.")
@@ -408,6 +741,11 @@ def _health(heartbeat_reader=None, max_hours=None, now=None, monitor_reader=None
     lines.append("Last API result: " + (f"{api.get('task')}={api.get('status')} ({api.get('category') or 'no error'})" if api else "not recorded"))
     error = registry.get("last_error")
     lines.append("Last error: " + (f"{error.get('task')} / {error.get('category')}: {error.get('message')}" if error else "none recorded"))
+    try:
+        from upload_availability import get_upload_limit_summary
+        lines.append(f"Upload limit status: {get_upload_limit_summary()}")
+    except Exception:
+        pass
     return "\n".join(lines)
 
 
@@ -453,6 +791,21 @@ def _task(args, queue_reader=None, monitor_reader=None):
                 parts.append(f"Clips: {', '.join(str(c) for c in controlled['clip_ids'][:5])}")
             if controlled.get("error"):
                 parts.append(f"error={monitoring.mask_secrets(str(controlled.get('error'))[:200])}")
+            result = controlled.get("result")
+            if isinstance(result, dict) and controlled.get("kind") == "upload":
+                parts.append(
+                    "Outcome: " + str(result.get("outcome", "unresolved"))
+                    + f"; selected={int(result.get('selected', 0) or 0)}"
+                    + f", uploaded={int(result.get('uploaded', 0) or 0)}"
+                    + f", publications={int(result.get('publications', 0) or 0)}"
+                )
+            try:
+                from telegram_bot.progress import get_task_progress
+                prog = get_task_progress(task_id)
+                if prog:
+                    parts.append(f"Progress: {int(prog.get('overall_progress', 0))}% ({prog.get('current_stage_name', prog.get('current_stage'))})")
+            except Exception:
+                pass
             return "; ".join(parts)
     except Exception:
         pass
@@ -536,10 +889,28 @@ def handle_update(update, owner_ids, *, queue_reader=None, heartbeat_reader=None
     """Return (chat_id, response) or None. Authorization precedes all protected reads."""
     if not is_authorized(update, owner_ids):
         return None
+    from telegram_bot import lifecycle
     callback = update.get("callback_query") if isinstance(update, dict) else None
     if isinstance(callback, dict):
         cb_message = callback.get("message") or {}
         chat_id = str((cb_message.get("chat") or {}).get("id", ""))
+        cb_data = callback.get("data") or ""
+
+        # Lifecycle callbacks (Start, Stop, Exit) are handled directly
+        if cb_data.startswith("life:"):
+            user_id = (callback.get("from") or {}).get("id")
+            text, markup = lifecycle.handle_lifecycle_callback(cb_data, user_id, chat_id)
+            return (chat_id, text, markup) if markup else (chat_id, text)
+
+        # Block other callbacks if bot is not RUNNING
+        current_state = lifecycle.get_state()
+        if current_state == lifecycle.STATE_STOPPED:
+            return chat_id, "Please first start the bot.", _stopped_keyboard()
+        if current_state == lifecycle.STATE_STARTING:
+            return chat_id, "Bot is currently starting up. Please wait.", None
+        if current_state == lifecycle.STATE_STOPPING:
+            return chat_id, "Bot is currently stopping. Please wait for shutdown to complete.", None
+
         legacy_approval = re.fullmatch(r"/(confirm|deny) ([A-Za-z0-9_-]{1,100})", callback.get("data", ""))
         if legacy_approval and isinstance(cb_message, dict):
             # Preserve the existing upload approval buttons through the original command path.
@@ -573,13 +944,72 @@ def handle_update(update, owner_ids, *, queue_reader=None, heartbeat_reader=None
                 "queue": "Queue information is unavailable because the saved queue could not be read. Check the local run log.",
                 "review": "Review list is unavailable because the saved queue could not be read. Check the local run log.",
                 "health": "Health information is incomplete because a local diagnostic could not be read. Check the local run log.",
+                "src_status": "Source status is unavailable. Check the local run log.",
+                "src_summary": "Source summary is unavailable. Check the local run log.",
+                "src_refresh_start": "Source refresh could not be completed. Check the local run log.",
+                "src_clean_preview": "Cleanup preview could not be generated. Check the local run log.",
             }
             text, markup = failure_messages.get(action, "Unable to read this monitoring information. Check the local run log."), _home_keyboard()
         return (chat_id, text, markup) if markup else (chat_id, text)
     message = update.get("message") or update.get("edited_message") or {}
+    raw = (message.get("text") or "").strip()
+    chat_id = str((message.get("chat") or {}).get("id", ""))
+
+    command, args = _parse_command(update, message)
+
+    # Lifecycle state gate for incoming messages:
+    current_state = lifecycle.get_state()
+    if current_state == lifecycle.STATE_STOPPED:
+        if command == "start":
+            if args:
+                return chat_id, "This command takes no arguments. Use /help."
+            return chat_id, _start(message), _stopped_keyboard()
+        return chat_id, "Please first start the bot.", _stopped_keyboard()
+    if current_state == lifecycle.STATE_STARTING:
+        return chat_id, "Bot is currently starting up. Please wait.", None
+    if current_state == lifecycle.STATE_STOPPING:
+        return chat_id, "Bot is currently stopping. Please wait for shutdown to complete.", None
+
+    user_id = (message.get("from") or {}).get("id")
+    from telegram_bot import source_manager
+    if user_id and source_manager.get_pending_input(user_id) == "add_source":
+        if raw.lower() in {"/cancel", "cancel", "/abort", "abort"}:
+            source_manager.clear_pending_input(user_id)
+            return str(message["chat"]["id"]), "Source addition cancelled.", _source_back_keyboard()
+        if raw.startswith("/") and not (raw.startswith("http://") or raw.startswith("https://")):
+            # User sent an unrelated command, abort pending source prompt and continue normal command routing
+            source_manager.clear_pending_input(user_id)
+        else:
+            try:
+                candidate = source_manager.validate_new_source(raw)
+            except ValueError as exc:
+                return str(message["chat"]["id"]), f"⚠️ Invalid YouTube URL: {str(exc)}\nPlease send a valid URL or /cancel to abort.", _source_back_keyboard()
+
+            source_manager.clear_pending_input(user_id)
+            if candidate.get("already_exists"):
+                return str(message["chat"]["id"]), f"⚠️ This source already exists in sources.txt:\n{candidate['normalized_url']}\nDuplicates cannot be added.", _source_back_keyboard()
+            if candidate.get("already_used"):
+                return str(message["chat"]["id"]), f"⚠️ This video is already marked as used/consumed in past runs:\n{candidate['normalized_url']}\nRe-adding consumed videos is prohibited.", _source_back_keyboard()
+            if candidate.get("is_blocked_active"):
+                return str(message["chat"]["id"]), f"⚠️ This video currently has active or blocked tasks in the queue:\n{candidate['normalized_url']}\nIt cannot be re-added.", _source_back_keyboard()
+
+            preview_text = (
+                "➕ Confirm New YouTube Source\n\n"
+                f"• URL: {candidate['normalized_url']}\n"
+                f"• Type: {'Direct Video' if candidate['source_type'] == 'video' else 'Channel/Handle'}\n"
+                f"• Video ID: {candidate.get('video_id') or 'N/A'}\n"
+                "• Already in sources.txt: No\n"
+                "• Used in past runs: No\n\n"
+                "Do you want to append this source to sources.txt?"
+            )
+            kb = {"inline_keyboard": [
+                [{"text": "✅ Add Source", "callback_data": f"src:add_confirm:{candidate['candidate_id']}"}],
+                [{"text": "❌ Cancel", "callback_data": f"src:add_cancel:{candidate['candidate_id']}"}],
+            ]}
+            return str(message["chat"]["id"]), preview_text, kb
+
     command, args = _parse_command(update, message)
     if command is None:
-        raw = (message.get("text") or "").strip()
         if raw.startswith("/"):
             return str(message["chat"]["id"]), "Unknown command. Use /help."
         return str(message["chat"]["id"]), _natural_language(
@@ -587,7 +1017,7 @@ def handle_update(update, owner_ids, *, queue_reader=None, heartbeat_reader=None
             report_client_factory=report_client_factory,
             intent_classifier=intent_classifier, audit_writer=audit_writer,
         )
-    if command in {"start", "help", "commands", "status", "health", "queue", "review", "logs", "history", "videos"} and args:
+    if command in {"start", "help", "commands", "status", "health", "queue", "review", "logs", "history", "videos", "sources", "sourcemanager"} and args:
         return str(message["chat"]["id"]), "This command takes no arguments. Use /help."
     if command in {"showanalytics", "showviews", "showlikes", "showcomments"} and not args:
         return str(message["chat"]["id"]), f"Usage: /{command} {'7d or 28d' if command == 'showanalytics' else 'VIDEO_ID'}"
@@ -620,6 +1050,10 @@ def handle_update(update, owner_ids, *, queue_reader=None, heartbeat_reader=None
         "retry": lambda msg: _control_retry(args[0], message),
         "confirm": lambda msg: _control_confirm(args[0], message, True),
         "deny": lambda msg: _control_confirm(args[0], message, False),
+        "sources": lambda msg: ("📚 PersonalAgent Source Manager\n\n"
+                                "Manage YouTube sources, check status, trigger daily refresh, clean used links, or add new sources."),
+        "sourcemanager": lambda msg: ("📚 PersonalAgent Source Manager\n\n"
+                                      "Manage YouTube sources, check status, trigger daily refresh, clean used links, or add new sources."),
     }
     try:
         response = registry[command](message)
@@ -645,6 +1079,8 @@ def handle_update(update, owner_ids, *, queue_reader=None, heartbeat_reader=None
             response = "Command failed. Check the local run log for details."
     if command == "start":
         return str(message["chat"]["id"]), response, _menu_keyboard()
+    if command in {"sources", "sourcemanager"}:
+        return str(message["chat"]["id"]), response, _source_menu_keyboard()
     return str(message["chat"]["id"]), response
 
 

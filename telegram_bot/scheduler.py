@@ -58,6 +58,14 @@ def _save_state(state):
             os.remove(name)
 
 
+def is_scheduler_configured_enabled():
+    """Check if scheduler is enabled either via config override or environment."""
+    st = _load_state()
+    if isinstance(st, dict) and "config" in st and "scheduler_enabled" in st["config"]:
+        return bool(st["config"]["scheduler_enabled"])
+    return _enabled("SCHEDULER_ENABLED")
+
+
 class Scheduler:
     """Small polling scheduler with persistent daily idempotency keys and bounded retries."""
 
@@ -85,6 +93,18 @@ class Scheduler:
         if _enabled("SCHEDULER_ENABLED") and not os.getenv("TELEGRAM_CHAT_ID", "").strip():
             raise ValueError("TELEGRAM_CHAT_ID is required when SCHEDULER_ENABLED=true.")
         self._leader_fd = None
+
+    def is_scheduler_enabled(self, state=None):
+        st = state if state is not None else _load_state()
+        if isinstance(st, dict) and "config" in st and "scheduler_enabled" in st["config"]:
+            return bool(st["config"]["scheduler_enabled"])
+        return _enabled("SCHEDULER_ENABLED")
+
+    def is_source_refresh_enabled(self, state=None):
+        st = state if state is not None else _load_state()
+        if isinstance(st, dict) and "config" in st and "source_refresh_enabled" in st["config"]:
+            return bool(st["config"]["source_refresh_enabled"])
+        return self.source_refresh_enabled
 
     def acquire_leader(self):
         LEADER_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -146,24 +166,12 @@ class Scheduler:
 
     def _source_refresh_job(self):
         """Refresh the curated long-video dataset, then append only unseen sources."""
-        commands = (
-            (sys.executable, "make_sources.py"),
-            (sys.executable, "merge_sources.py"),
-        )
-        outputs = []
-        for command in commands:
-            try:
-                result = subprocess.run(
-                    command, check=False, capture_output=True, text=True,
-                    encoding="utf-8", errors="replace", timeout=60 * 60,
-                )
-            except subprocess.TimeoutExpired as exc:
-                raise RuntimeError(f"{command[1]} timed out after one hour.") from exc
-            if result.returncode != 0:
-                detail = (result.stderr or result.stdout or "No details returned.").strip()
-                raise RuntimeError(f"{command[1]} exited with code {result.returncode}: {detail[-1200:]}")
-            outputs.append((result.stdout or "").strip())
-        return "\n".join(line for line in outputs if line)
+        from telegram_bot.source_manager import run_source_refresh
+        record = run_source_refresh()
+        if isinstance(record, dict) and record.get("status") == "failed":
+            raise RuntimeError(record.get("error") or "Source refresh execution failed.")
+        return record
+
 
     def _paused(self):
         try:
@@ -224,7 +232,13 @@ class Scheduler:
                 state["jobs"][key].update(status="completed", result=str(result), finished_at=now_ts)
             elif kind == "source_refresh":
                 result = self._source_refresh_job()
-                state["jobs"][key].update(status="completed", result=str(result)[-2000:], finished_at=now_ts)
+                status_name = result.get("status", "completed") if isinstance(result, dict) else "completed"
+                state["jobs"][key].update(
+                    status="completed" if (status_name == "completed" or status_name.startswith("success") or status_name == "partial_results") else "failed",
+                    result=result if isinstance(result, dict) else str(result)[-2000:],
+                    detailed_status=status_name,
+                    finished_at=now_ts,
+                )
             else:
                 remaining = max(0, self.daily_draft_limit - len(state["jobs"][key].get("draft_ids", [])))
                 if remaining == 0:
@@ -279,17 +293,23 @@ class Scheduler:
         timestamp = instant.timestamp()
         state = _load_state()
         self._finalize_worker_tasks(state, timestamp)
-        if not _enabled("SCHEDULER_ENABLED"):
+        try:
+            from upload_availability import check_and_deliver_pending_recovery_alert
+            check_and_deliver_pending_recovery_alert()
+        except Exception:
+            pass
+        if not self.is_scheduler_enabled(state):
             _save_state(state)
             return
         if not self._paused():
             date_key = local.strftime("%Y-%m-%d")
-            if self.source_refresh_enabled and (local.hour, local.minute) >= self.source_refresh_time:
+            refresh_enabled = self.is_source_refresh_enabled(state)
+            if refresh_enabled and (local.hour, local.minute) >= self.source_refresh_time:
                 self._run_due(state, f"sources:{date_key}", "source_refresh", None, timestamp)
             prepare_due = (local.hour, local.minute) >= self.prepare_time
             if self.prepare_enabled and prepare_due:
                 refresh = state["jobs"].get(f"sources:{date_key}")
-                if not self.source_refresh_enabled or (refresh and refresh.get("status") == "completed"):
+                if not refresh_enabled or (refresh and refresh.get("status") == "completed"):
                     self._run_due(state, f"prepare:{date_key}", "prepare", None, timestamp)
             if self.analytics_enabled and (local.hour, local.minute) >= self.analytics_time:
                 period = os.getenv("SCHEDULER_ANALYTICS_RANGE", "7d").strip()
@@ -297,6 +317,7 @@ class Scheduler:
                     self._run_due(state, f"analytics:{date_key}", "analytics", period, timestamp)
         self._retry_or_recover(state, timestamp)
         _save_state(state)
+
 
 
 def run_scheduler(*, scheduler=None, stop_event=None, sleep=time.sleep, interval=15):

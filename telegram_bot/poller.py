@@ -61,6 +61,33 @@ class PollLock:
             self.held = False
 
 
+OFFSET_PATH = Path(os.getenv("TELEGRAM_OFFSET_FILE", "data/telegram_offset.json"))
+
+
+def _load_offset(path=OFFSET_PATH):
+    try:
+        p = Path(path)
+        if p.exists():
+            data = json.loads(p.read_text(encoding="utf-8"))
+            off = data.get("offset")
+            if isinstance(off, int) and off > 0:
+                return off
+    except Exception:
+        pass
+    return None
+
+
+def _save_offset(offset, path=OFFSET_PATH):
+    try:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"offset": offset, "updated_at": time.time()}), encoding="utf-8")
+        os.replace(tmp, p)
+    except Exception:
+        pass
+
+
 def _api_call(token, method, params=None, timeout=40):
     url = f"https://api.telegram.org/bot{token}/{method}"
     data = urllib.parse.urlencode(params or {}).encode("utf-8") if params else None
@@ -72,6 +99,16 @@ def _api_call(token, method, params=None, timeout=40):
         # Telegram 409 means another getUpdates consumer owns this bot token.
         if exc.code == 409:
             raise RuntimeError("polling_conflict") from None
+        try:
+            err_body = exc.read().decode("utf-8", errors="replace")
+            err_json = json.loads(err_body)
+            desc = err_json.get("description", "").lower()
+            if "query is too old" in desc or "query id is invalid" in desc:
+                raise RuntimeError("stale_callback") from None
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
         raise RuntimeError("telegram_api_error") from None
     except Exception:
         raise RuntimeError("telegram_api_error") from None
@@ -81,7 +118,7 @@ def _api_call(token, method, params=None, timeout=40):
 
 
 def run_bot(*, token=None, owner_ids_raw=None, api_call=None, reply_sender=None, lock=None,
-            sleep=time.sleep, stop_requested=None):
+            sleep=time.sleep, stop_requested=None, offset_path=None):
     """Run until interrupted; injected API and sender allow offline tests."""
     load_project_env()
     token = (token if token is not None else os.getenv("TELEGRAM_BOT_TOKEN", "")).strip()
@@ -100,20 +137,29 @@ def run_bot(*, token=None, owner_ids_raw=None, api_call=None, reply_sender=None,
         reconcile_tasks()
     except Exception:
         pass
-    offset = None
+
+    offset_file = Path(offset_path) if offset_path else Path(os.getenv("TELEGRAM_OFFSET_FILE", "data/telegram_offset.json"))
+    offset = _load_offset(offset_file)
+    initial_poll = (offset is None)
+
     answered_callbacks = set()
     callback_order = deque()
-    scheduler_stop = threading.Event()
-    scheduler_thread = None
     try:
-        if os.getenv("SCHEDULER_ENABLED", "false").strip().lower() in ("true", "1", "t", "yes"):
-            from telegram_bot.scheduler import Scheduler, run_scheduler
-            scheduler = Scheduler()  # Validate timezone, times, limits and report destination before starting.
-            scheduler_thread = threading.Thread(target=run_scheduler,
-                                                kwargs={"scheduler": scheduler, "stop_event": scheduler_stop},
-                                                daemon=True, name="personal-agent-scheduler")
-            scheduler_thread.start()
-        while not (stop_requested and stop_requested()):
+        from telegram_bot.lifecycle import (
+            reconcile_lifecycle_on_boot,
+            get_state,
+            start_scheduler,
+            stop_scheduler,
+            is_exit_requested,
+            reset_exit_request,
+            STATE_RUNNING,
+        )
+        reset_exit_request()
+        reconcile_lifecycle_on_boot()
+        if get_state() == STATE_RUNNING:
+            start_scheduler()
+
+        while not ((stop_requested and stop_requested()) or is_exit_requested()):
             try:
                 params = {"timeout": 30, "allowed_updates": json.dumps(["message", "edited_message", "callback_query"])}
                 if offset is not None:
@@ -121,8 +167,12 @@ def run_bot(*, token=None, owner_ids_raw=None, api_call=None, reply_sender=None,
                 updates = api_call(token, "getUpdates", params, 40) or []
                 for update in updates:
                     offset = int(update.get("update_id", 0)) + 1
+                    _save_offset(offset, offset_file)
+
                     callback = update.get("callback_query") if isinstance(update, dict) else None
                     callback_id = callback.get("id") if isinstance(callback, dict) else None
+                    cb_data = callback.get("data") if callback else ""
+
                     if callback_id and callback_id in answered_callbacks:
                         try:
                             api_call(token, "answerCallbackQuery", {"callback_query_id": callback_id,
@@ -130,27 +180,50 @@ def run_bot(*, token=None, owner_ids_raw=None, api_call=None, reply_sender=None,
                         except Exception:
                             pass
                         continue
-                    try:
-                        reply = handle_update(update, owner_ids)
-                        if callback_id:
-                            answered_callbacks.add(callback_id)
-                            callback_order.append(callback_id)
-                            if len(callback_order) > 512:
-                                answered_callbacks.discard(callback_order.popleft())
-                            try:
-                                api_call(token, "answerCallbackQuery", {"callback_query_id": callback_id}, 10)
-                            except Exception:
-                                # A callback response must not stop polling or expose callback data.
+
+                    is_stale = False
+                    if callback_id:
+                        answered_callbacks.add(callback_id)
+                        callback_order.append(callback_id)
+                        if len(callback_order) > 512:
+                            answered_callbacks.discard(callback_order.popleft())
+                        try:
+                            api_call(token, "answerCallbackQuery", {"callback_query_id": callback_id}, 10)
+                        except RuntimeError as exc:
+                            if str(exc) == "stale_callback":
+                                is_stale = True
+                            else:
                                 try:
                                     from logger import log_warn
                                     log_warn("[Telegram] Could not acknowledge an inline button callback.")
                                 except Exception:
                                     pass
+                        except Exception:
+                            try:
+                                from logger import log_warn
+                                log_warn("[Telegram] Could not acknowledge an inline button callback.")
+                            except Exception:
+                                pass
+
+                    # Dismiss stale exit confirmation from an old session if expired on Telegram
+                    if is_stale and cb_data == "life:exit_confirm":
+                        try:
+                            from logger import log
+                            log("[Telegram] Dismissed stale exit confirmation from previous session.")
+                        except Exception:
+                            pass
+                        continue
+
+                    try:
+                        reply = handle_update(update, owner_ids)
                         if reply:
                             chat_id, text = reply[:2]
                             markup = reply[2] if len(reply) > 2 else None
                             if markup:
-                                reply_sender(chat_id, text, reply_markup=markup)
+                                try:
+                                    reply_sender(chat_id, text, reply_markup=markup)
+                                except TypeError:
+                                    reply_sender(chat_id, text)
                             else:
                                 reply_sender(chat_id, text)
                     except Exception:
@@ -162,6 +235,17 @@ def run_bot(*, token=None, owner_ids_raw=None, api_call=None, reply_sender=None,
                             except Exception:
                                 pass
                         continue
+
+                    if is_exit_requested():
+                        # Acknowledge offset to Telegram immediately on clean exit
+                        if offset is not None:
+                            try:
+                                api_call(token, "getUpdates", {"offset": offset, "limit": 1, "timeout": 0}, timeout=5)
+                            except Exception:
+                                pass
+                        break
+
+                initial_poll = False
             except RuntimeError as exc:
                 if str(exc) == "polling_conflict":
                     raise RuntimeError("Telegram reports another polling process; stopping this bot.") from None
@@ -179,7 +263,15 @@ def run_bot(*, token=None, owner_ids_raw=None, api_call=None, reply_sender=None,
                     pass
                 sleep(3)
     finally:
-        scheduler_stop.set()
-        if scheduler_thread and scheduler_thread.is_alive():
-            scheduler_thread.join(timeout=2)
+        # If exit was requested, ensure offset was confirmed to Telegram so it is never re-delivered
+        if is_exit_requested() and offset is not None:
+            try:
+                api_call(token, "getUpdates", {"offset": offset, "limit": 1, "timeout": 0}, timeout=5)
+            except Exception:
+                pass
+        try:
+            from telegram_bot.lifecycle import stop_scheduler
+            stop_scheduler()
+        except Exception:
+            pass
         lock.release()

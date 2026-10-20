@@ -7,7 +7,7 @@ import types
 import unittest
 from pathlib import Path
 from contextlib import contextmanager
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import retry
 from retry import AccountUploadLimitError, UploadOutcomeUnknownError, UploadCommittedInterruptedError
@@ -610,6 +610,7 @@ class PreparationDiagnosticsTests(unittest.TestCase):
 
     def test_direct_live_render_without_telegram_approval_cannot_publish(self):
         main = load_main_with_stubs()
+        from upload_auth import UploadApprovalRequiredError
         queue = [{"id": "clip-1", "key": "k1", "status": "pending"}]
         service_calls = []
         upload_calls = []
@@ -618,10 +619,52 @@ class PreparationDiagnosticsTests(unittest.TestCase):
         main.get_service = lambda: service_calls.append("service")
         main.upload = lambda *args, **kwargs: upload_calls.append("upload")
         with patch.dict(os.environ, {}, clear=True):
-            main.render_stage()
+            with self.assertRaises(UploadApprovalRequiredError):
+                main.render_stage()
         self.assertEqual(service_calls, [])
         self.assertEqual(upload_calls, [])
         self.assertEqual(queue[0]["status"], "pending")
+
+    def test_youtube_service_initialization_failure_fails_task_and_preserves_queue(self):
+        main = load_main_with_stubs()
+        from telegram_bot import control, monitoring
+        from retry import AuthError
+        failure = AuthError("YouTube credentials rejected")
+        queue = [{"id": "clip-auth", "key": "source:1-2", "status": "pending",
+                  "title": "Auth test", "source_id": "src"}]
+        queue_before = json.dumps(queue, sort_keys=True)
+
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as directory:
+            control_path = Path(directory) / "telegram_control.json"
+            main.load_queue = lambda: queue
+            main.save_queue = lambda value: None
+            main.load_state = lambda: {}
+            main.get_service = MagicMock(side_effect=failure)
+            with patch.object(control, "CONTROL_FILE", control_path):
+                control._write({"tasks": {"auth-task": {
+                    "id": "auth-task", "kind": "upload", "status": "running",
+                    "owner_id": "12345", "chat_id": "12345", "clip_ids": [],
+                }}})
+                with patch.dict(os.environ, {"AGENT_CONTROL_TASK_ID": "auth-task",
+                                             "AGENT_CONTROL_CHAT_ID": "12345"}), \
+                     patch.object(main, "acquire_lock"), patch.object(main, "release_lock"), \
+                     patch.object(monitoring, "begin_run"), patch.object(monitoring, "finish_run"), \
+                     patch.object(monitoring, "read_registry", return_value={"stage": "render", "current_task": "initialize YouTube service"}), \
+                     patch("telegram_bot.progress.get_tracker", return_value=None), \
+                     patch.object(main, "notify_run_error") as error_notice, \
+                     patch.object(main, "log_error"), patch.object(main, "log_event"), \
+                     patch("sys.argv", ["main.py", "render"]):
+                    with self.assertRaises(AuthError) as raised:
+                        main.main()
+                    task = control.task_info("auth-task")
+
+        self.assertIs(raised.exception, failure)
+        self.assertEqual(task["status"], "failed")
+        self.assertIn("YouTube credentials rejected", task["error"])
+        self.assertEqual(queue[0]["status"], "pending")
+        self.assertEqual(json.dumps(queue, sort_keys=True), queue_before)
+        main.get_service.assert_called_once_with()
+        error_notice.assert_called_once()
 
     def test_needs_review_clip_is_never_automatically_reprocessed(self):
         main = load_main_with_stubs()
@@ -632,6 +675,79 @@ class PreparationDiagnosticsTests(unittest.TestCase):
         main.load_state = lambda: {}
         main.render_stage()
         self.assertEqual(queue[0]["status"], "needs_review")
+
+    def test_empty_upload_queue_records_no_work_without_confirmation_or_upload(self):
+        main = load_main_with_stubs()
+        main.load_queue = lambda: []
+        main.load_state = lambda: {}
+        tracker = types.SimpleNamespace(complete_stage=MagicMock())
+        upload_calls = []
+        main.upload = lambda *args, **kwargs: upload_calls.append((args, kwargs))
+
+        with patch.dict(os.environ, {"AGENT_CONTROL_TASK_ID": "empty-task"}), \
+             patch("telegram_bot.progress.get_tracker", return_value=tracker):
+            main.render_stage()
+
+        tracker.complete_stage.assert_called_once_with(
+            "queue_assessment",
+            detail="No eligible clips; no confirmation was requested and no upload was attempted.",
+        )
+        self.assertEqual(upload_calls, [])
+
+    def test_main_finalizes_empty_controlled_upload_as_no_eligible_clips(self):
+        main = load_main_with_stubs()
+        from telegram_bot import control, monitoring
+
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as directory:
+            control_path = Path(directory) / "telegram_control.json"
+            main.load_queue = lambda: []
+            main.render_stage = lambda: None
+            with patch.object(control, "CONTROL_FILE", control_path):
+                control._write({"tasks": {"empty-task": {
+                    "id": "empty-task", "kind": "upload", "status": "running",
+                    "owner_id": "12345", "chat_id": "12345", "clip_ids": [],
+                }}})
+                with patch.dict(os.environ, {"AGENT_CONTROL_TASK_ID": "empty-task"}), \
+                     patch.object(main, "acquire_lock"), patch.object(main, "release_lock"), \
+                     patch.object(monitoring, "begin_run"), patch.object(monitoring, "finish_run"), \
+                     patch("telegram_bot.progress.get_tracker", return_value=None), \
+                     patch("sys.argv", ["main.py", "render"]):
+                    main.main()
+                    task = control.task_info("empty-task")
+
+        self.assertEqual(task["status"], "no_eligible_clips")
+        self.assertEqual(task["result"]["outcome"], "no_eligible_clips")
+        self.assertEqual(task["result"]["selected"], 0)
+        self.assertEqual(task["result"]["uploaded"], 0)
+        self.assertEqual(task["result"]["publications"], 0)
+
+    def test_main_does_not_complete_selected_uploads_left_pending(self):
+        main = load_main_with_stubs()
+        from telegram_bot import control, monitoring
+
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as directory:
+            control_path = Path(directory) / "telegram_control.json"
+            main.load_queue = lambda: [{
+                "id": "clip-pending", "key": "source:1-2", "status": "pending",
+                "youtube_video_id": None,
+            }]
+            main.render_stage = lambda: None
+            with patch.object(control, "CONTROL_FILE", control_path):
+                control._write({"tasks": {"pending-task": {
+                    "id": "pending-task", "kind": "upload", "status": "running",
+                    "owner_id": "12345", "chat_id": "12345", "clip_ids": ["clip-pending"],
+                }}})
+                with patch.dict(os.environ, {"AGENT_CONTROL_TASK_ID": "pending-task"}), \
+                     patch.object(main, "acquire_lock"), patch.object(main, "release_lock"), \
+                     patch.object(monitoring, "begin_run"), patch.object(monitoring, "finish_run"), \
+                     patch("telegram_bot.progress.get_tracker", return_value=None), \
+                     patch("sys.argv", ["main.py", "render"]):
+                    main.main()
+                    task = control.task_info("pending-task")
+
+        self.assertEqual(task["status"], "failed")
+        self.assertEqual(task["result"]["selected"], 1)
+        self.assertEqual(task["result"]["uploaded"], 0)
 
 
 if __name__ == "__main__":
