@@ -34,5 +34,6 @@ COPY . .
 # Ensure storage directories exist with appropriate permissions
 RUN mkdir -p data review logs work
 
-# Set default command to run the Telegram control panel bot
-CMD ["python", "main.py", "telegram-bot"]
+# Copy Render runtime secret files into the paths used by the application,
+# then start the Telegram control panel bot. Render's Docker Command can stay blank.
+CMD ["/bin/sh", "/app/docker-entrypoint.sh"]
